@@ -5,11 +5,13 @@ Trade logging utility: log, summarize, and export options trades.
 
 import csv
 import json
+import os
 from datetime import date, datetime
 from typing import List, Optional
 
-TRADE_LOG = '/Users/noahrourke/trading-system/trade_log.json'
-TRADE_CSV = '/Users/noahrourke/trading-system/trade_log.csv'
+_DIR      = os.path.dirname(os.path.abspath(__file__))
+TRADE_LOG = os.path.join(_DIR, 'trade_log.json')
+TRADE_CSV = os.path.join(_DIR, 'trade_log.csv')
 
 
 def _load() -> List[dict]:

@@ -37,8 +37,9 @@ IV_RANK_MAX       = 50
 COOLDOWN_N        = 3
 DISCORD_WEBHOOK   = os.getenv('DISCORD_WEBHOOK_URL')
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
-SCANNER_LOG       = '/Users/noahrourke/trading-system/scanner_log.json'
-TRADE_LOG         = '/Users/noahrourke/trading-system/trade_log.json'
+_DIR              = os.path.dirname(os.path.abspath(__file__))
+SCANNER_LOG       = os.path.join(_DIR, 'scanner_log.json')
+TRADE_LOG         = os.path.join(_DIR, 'trade_log.json')
 ET                = pytz.timezone('US/Eastern')
 
 # Hardcoded FOMC decision dates 2025-2026
@@ -351,6 +352,23 @@ def today_consecutive_losses():
         return 0
 
 
+# ── STARTUP FILE INIT ─────────────────────────────────────────────────────────
+
+def _init_data_files():
+    """Create required JSON files with empty defaults if they don't exist yet."""
+    defaults = {
+        SCANNER_LOG:                            [],
+        TRADE_LOG:                              [],
+        os.path.join(_DIR, 'paper_trades.json'):  [],
+        os.path.join(_DIR, 'position_state.json'): {},
+    }
+    for path, empty in defaults.items():
+        if not os.path.exists(path):
+            with open(path, 'w') as f:
+                json.dump(empty, f)
+            print(f'[init] Created {os.path.basename(path)}')
+
+
 # ── LOGGING ───────────────────────────────────────────────────────────────────
 
 def log_scan(entry):
@@ -480,6 +498,9 @@ def main():
     print('  OPTIONS SCANNER  |  SPY + QQQ')
     print('  Runs every 60 min, 9:30–16:00 ET, Mon–Fri')
     print('=' * 60)
+
+    # Ensure required data files exist before any read/write attempt
+    _init_data_files()
 
     # Reconcile open Alpaca positions against state file before anything else.
     # Guards against ephemeral filesystem loss on Railway redeploy.
