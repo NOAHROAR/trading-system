@@ -258,10 +258,7 @@ def run_scan():
     now_str    = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
 
     if not market_hrs:
-        print(f'[{now_str}] Outside market hours.')
-        _log_scan({'timestamp': now_str, 'event': 'SCAN', 'market_hours': False,
-                   'tickers_checked': TICKERS, 'ticker_results': [],
-                   'pending_from_previous': [], 'open_positions': 0})
+        print(f'[{now_str}] Outside market hours, skipping.')
         return
 
     print(f'\n[{now_str}] VS scan …')
