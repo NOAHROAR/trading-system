@@ -164,7 +164,7 @@ def today_consecutive_losses():
 
 # ── ENTRY ─────────────────────────────────────────────────────────────────────
 
-def execute_vs_trade(sig, discord_fn=None):
+def execute_vs_trade(sig, discord_fn=None, scan_log_fn=None):
     """
     Place entry share order for a confirmed VS signal.
 
@@ -211,6 +211,15 @@ def execute_vs_trade(sig, discord_fn=None):
                    f'(${start_equity:,.0f} → ${equity:,.0f}) — trading paused.')
             if discord_fn:
                 discord_fn(msg)
+            if scan_log_fn:
+                scan_log_fn({
+                    'timestamp':     datetime.now(ET).strftime('%Y-%m-%d %H:%M ET'),
+                    'event':         'DRAWDOWN_BLOCK',
+                    'ticker':        ticker,
+                    'equity':        round(equity, 2),
+                    'start_equity':  round(start_equity, 2),
+                    'threshold_pct': round(DRAWDOWN_LIMIT * 100, 1),
+                })
             return _block(f'equity ${equity:.0f} below 90% of start ${start_equity:.0f}')
 
         # 5. Size: shares = floor($125 / stop_dist), capped at $500 notional
@@ -260,7 +269,7 @@ def execute_vs_trade(sig, discord_fn=None):
             'status':       'SUBMITTED',
         })
 
-        # 8. Discord entry alert
+        # 8. Discord entry alert + scan log
         dir_label = 'LONG' if direction == 'long' else 'SHORT'
         if discord_fn:
             discord_fn(
@@ -269,6 +278,17 @@ def execute_vs_trade(sig, discord_fn=None):
                 f'| Target: ${sig["target_price"]:.2f} '
                 f'| Shares: {shares} | Risk: ${risk_actual:.0f}'
             )
+        if scan_log_fn:
+            scan_log_fn({
+                'timestamp':   datetime.now(ET).strftime('%Y-%m-%d %H:%M ET'),
+                'event':       'ENTRY_EXECUTED',
+                'ticker':      ticker,
+                'direction':   direction,
+                'entry_price': entry_px,
+                'stop':        stop_px,
+                'target':      sig['target_price'],
+                'shares':      shares,
+            })
 
         return f'Submitted: {side} {shares} {ticker} @ market'
 
@@ -280,7 +300,7 @@ def execute_vs_trade(sig, discord_fn=None):
 
 # ── EXIT ──────────────────────────────────────────────────────────────────────
 
-def _close_position(ticker, entry, reason, current_price, discord_fn=None):
+def _close_position(ticker, entry, reason, current_price, discord_fn=None, scan_log_fn=None):
     """
     Place market close order and log P&L.
     reason: 'TARGET' | 'STOP' | 'EOD'
@@ -337,6 +357,15 @@ def _close_position(ticker, entry, reason, current_price, discord_fn=None):
             'status':      'CLOSED',
         })
         _log_trade(today_str, result, ticker, pnl)
+        if scan_log_fn:
+            scan_log_fn({
+                'timestamp':   datetime.now(ET).strftime('%Y-%m-%d %H:%M ET'),
+                'event':       'EXIT',
+                'ticker':      ticker,
+                'exit_reason': reason.lower(),
+                'pnl_dollar':  round(pnl, 2),
+                'pnl_pct':    round(pct, 2),
+            })
         return True
 
     except Exception as e:
@@ -350,7 +379,7 @@ def _close_position(ticker, entry, reason, current_price, discord_fn=None):
 
 # ── POSITION MONITOR ──────────────────────────────────────────────────────────
 
-def monitor_positions(discord_fn=None):
+def monitor_positions(discord_fn=None, scan_log_fn=None):
     """
     Called on every 15-min scan. Checks all open positions against stop/target/EOD.
     Exit priority: EOD → TARGET → STOP.
@@ -395,7 +424,7 @@ def monitor_positions(discord_fn=None):
                 reason = 'STOP'
 
         if reason:
-            ok = _close_position(ticker, entry, reason, current_price, discord_fn)
+            ok = _close_position(ticker, entry, reason, current_price, discord_fn, scan_log_fn)
             if ok:
                 to_remove.append(ticker)
 

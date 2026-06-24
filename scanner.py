@@ -245,6 +245,8 @@ def _log_scan(entry):
     except Exception:
         log = []
     log.append(entry)
+    if len(log) > 500:
+        log = log[-500:]
     with open(SCANNER_LOG, 'w') as f:
         json.dump(log, f, indent=2, default=str)
 
@@ -252,15 +254,20 @@ def _log_scan(entry):
 # ── MAIN SCAN ─────────────────────────────────────────────────────────────────
 
 def run_scan():
-    if not is_market_hours():
-        print(f'[{datetime.now(ET).strftime("%H:%M ET")}] Outside market hours.')
+    market_hrs = is_market_hours()
+    now_str    = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
+
+    if not market_hrs:
+        print(f'[{now_str}] Outside market hours.')
+        _log_scan({'timestamp': now_str, 'event': 'SCAN', 'market_hours': False,
+                   'tickers_checked': TICKERS, 'ticker_results': [],
+                   'pending_from_previous': [], 'open_positions': 0})
         return
 
-    now_str = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
     print(f'\n[{now_str}] VS scan …')
 
     # ── Step 1: Monitor exits (runs every scan, regardless of cooldown) ───────
-    monitor_positions(send_discord)
+    monitor_positions(send_discord, scan_log_fn=_log_scan)
 
     # ── Step 2: EOD — clear pending signals, no new entries ──────────────────
     if _is_eod():
@@ -278,66 +285,85 @@ def run_scan():
         _log_scan({'timestamp': now_str, 'event': 'COOLDOWN', 'losses': consec})
         return
 
-    state      = load_state()
-    pending    = _load_pending()
-    new_pending = {}   # rebuilt each scan; only carries forward freshly detected spikes
-    can_enter  = _can_enter()
+    state                = load_state()
+    pending              = _load_pending()
+    new_pending          = {}   # rebuilt each scan; only carries forward freshly detected spikes
+    can_enter            = _can_enter()
+    open_positions_at_scan = len(state)
+    ticker_results       = []
 
     for ticker in TICKERS:
         bars = fetch_bars(ticker, limit=25)
         if len(bars) < VOL_MA_LEN + 2:
             print(f'  {ticker}: only {len(bars)} bars — skip')
+            ticker_results.append({'ticker': ticker, 'result': 'skipped',
+                                   'reason': f'insufficient_bars ({len(bars)})'})
             continue
 
         # ── 5a. Process pending spike → confirmation → entry ──────────────────
         if ticker in pending:
             spike = pending[ticker]
+            _log_scan({'timestamp': now_str, 'event': 'PENDING_CONFIRMATION',
+                       'ticker': ticker, 'waiting_since': spike.get('ts', '?')})
+
             # Verify the spike bar is now bars[-2] (exactly 1 bar old)
             if bars[-2]['t'] == spike['ts']:
-                # Check if we can enter
                 if ticker in state:
                     # Position was opened by another signal in the meantime — discard
                     print(f'  {ticker}: pending but position now open — discard')
+                    ticker_results.append({'ticker': ticker, 'result': 'pending_confirmation',
+                                           'confirmed': False,
+                                           'reason': 'position_already_open'})
                 elif len(state) >= MAX_POSITIONS:
                     # Max positions reached between spike detection and confirmation
                     print(f'  {ticker}: pending confirmation skipped — max positions')
                     send_discord(f'⏭️ SIGNAL SKIPPED | {ticker} | Max 3 positions open')
                     _log_scan({'timestamp': now_str, 'ticker': ticker,
                                'event': 'CONF_SKIPPED_MAX_POS'})
+                    ticker_results.append({'ticker': ticker, 'result': 'pending_confirmation',
+                                           'confirmed': False, 'reason': 'max_positions'})
                 else:
                     sig = build_entry_sig(ticker, spike, bars[-1])
                     if sig is None:
                         print(f'  {ticker}: degenerate stop — discard')
+                        ticker_results.append({'ticker': ticker, 'result': 'pending_confirmation',
+                                               'confirmed': False, 'reason': 'degenerate_stop'})
                     else:
                         dir_label = 'LONG' if sig['direction'] == 'long' else 'SHORT'
                         print(f'  {ticker}: entering {dir_label} @ ${sig["entry_price"]:.2f} '
                               f'(confirmation of {spike["vol_ratio"]}x spike)')
-                        result = execute_vs_trade(sig, discord_fn=send_discord)
+                        result = execute_vs_trade(sig, discord_fn=send_discord,
+                                                  scan_log_fn=_log_scan)
                         print(f'  {ticker}: {result}')
                         # Reload state in case another ticker was just opened
                         state = load_state()
-                        _log_scan({'timestamp': now_str, 'ticker': ticker,
-                                   'event': 'ENTRY', 'direction': dir_label,
-                                   'result': result})
+                        ticker_results.append({'ticker': ticker, 'result': 'pending_confirmation',
+                                               'confirmed': True, 'direction': dir_label,
+                                               'entry_price': sig['entry_price']})
             else:
                 # bars[-2].t ≠ spike.ts → spike is > 1 bar old, stale
                 print(f'  {ticker}: pending spike stale (spike_ts={spike["ts"]}, '
                       f'bars[-2].t={bars[-2]["t"]}) — discard')
-                _log_scan({'timestamp': now_str, 'ticker': ticker,
-                           'event': 'STALE_SPIKE'})
+                _log_scan({'timestamp': now_str, 'ticker': ticker, 'event': 'STALE_SPIKE'})
+                ticker_results.append({'ticker': ticker, 'result': 'skipped',
+                                       'reason': 'stale_spike'})
             # Either way, don't carry forward this pending entry
             continue
 
         # ── 5b. Detect new spike on bars[-1] — gated by entry cutoff ────────
         if not can_enter:
+            ticker_results.append({'ticker': ticker, 'result': 'skipped',
+                                   'reason': 'past_entry_cutoff_3:30pm'})
             continue
 
         if ticker in state:
             print(f'  {ticker}: position open')
+            ticker_results.append({'ticker': ticker, 'result': 'position_open'})
             continue
 
         if len(state) >= MAX_POSITIONS:
-            # Don't run spike detection if we can't enter anyway
+            ticker_results.append({'ticker': ticker, 'result': 'skipped',
+                                   'reason': 'max_positions'})
             continue
 
         spike = detect_spike(bars)
@@ -351,13 +377,29 @@ def run_scan():
                 f'| Waiting for confirmation bar'
             )
             new_pending[ticker] = spike
-            _log_scan({'timestamp': now_str, 'ticker': ticker,
-                       'event': 'SPIKE_DETECTED', 'direction': dir_label,
-                       'vol_ratio': spike['vol_ratio'], 'spike_pct': spike['spike_pct']})
+            _log_scan({'timestamp': now_str, 'event': 'SPIKE_DETECTED',
+                       'ticker': ticker, 'direction': dir_label,
+                       'vol_ratio': spike['vol_ratio'],
+                       'spike_move_pct': spike['spike_pct']})
+            ticker_results.append({'ticker': ticker, 'result': 'spike_detected',
+                                   'direction': dir_label,
+                                   'vol_ratio': spike['vol_ratio'],
+                                   'spike_move_pct': spike['spike_pct']})
         else:
             print(f'  {ticker}: no signal')
+            ticker_results.append({'ticker': ticker, 'result': 'no_signal'})
 
     _save_pending(new_pending)
+
+    _log_scan({
+        'timestamp':            now_str,
+        'event':                'SCAN',
+        'market_hours':         True,
+        'tickers_checked':      TICKERS,
+        'ticker_results':       ticker_results,
+        'pending_from_previous': list(pending.keys()),
+        'open_positions':       open_positions_at_scan,
+    })
 
 
 # ── DAILY SUMMARY ─────────────────────────────────────────────────────────────
