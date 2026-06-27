@@ -1,0 +1,1218 @@
+#!/usr/bin/env python3
+"""
+credit_spread_strat.py — 7DTE SPY Put Credit Spread Strategy.
+
+STANDALONE: no imports from scanner.py or paper_execution.py.
+DORMANT until ACTIVE = True.
+
+Alpaca API: raw requests only (no SDK; requirements.txt: requests==2.32.5).
+  POST /v2/orders  order_class='mleg'  for multi-leg spread orders.
+
+State files (all independent of scanner.py's files):
+  credit_spread_positions.json — open positions + daily summary flag
+  credit_spread_state.json     — weekly_realized_loss, cooldown_active, week_start_date
+  credit_spread_trade_log.json — permanent trade history (never truncated)
+  credit_spread_log.json       — rolling 500-entry scan log
+
+Deploy as a second Railway worker:
+  Add to Procfile:  credit_spread: python3 credit_spread_strat.py
+"""
+
+import json
+import math
+import os
+import time
+from datetime import date, datetime, timedelta
+
+import pandas as pd
+import pytz
+import requests
+import schedule
+import yfinance as yf
+from dotenv import load_dotenv
+from scipy.stats import norm
+
+load_dotenv()
+
+# ── ACTIVATION FLAG ────────────────────────────────────────────────────────────
+ACTIVE = False  # Set to True to enable live order placement
+
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
+DISCORD_WEBHOOK = os.getenv('DISCORD_WEBHOOK_URL')
+ALPACA_KEY      = os.getenv('ALPACA_KEY')
+ALPACA_SECRET   = os.getenv('ALPACA_SECRET')
+PAPER_BASE_URL  = 'https://paper-api.alpaca.markets'
+DATA_URL        = 'https://data.alpaca.markets'
+ET              = pytz.timezone('US/Eastern')
+_DIR            = os.path.dirname(os.path.abspath(__file__))
+
+# Strategy parameters
+TARGET_DTE        = 7
+DTE_MIN           = 6
+DTE_MAX           = 8
+TARGET_DELTA      = 0.20
+DELTA_TOLERANCE   = 0.05     # reject if no strike within 0.05 of target delta
+SPREAD_WIDTH      = 5.0
+MIN_CREDIT        = 0.25
+MAX_POSITIONS     = 2
+PROFIT_TARGET_PCT = 0.50
+STOP_LOSS_PCT     = 2.00
+ORDER_FILL_TIMEOUT = 300
+WEEKLY_LOSS_LIMIT = 1_000.0
+RISK_FREE_RATE    = 0.045
+VIX_IVR_WINDOW    = 252
+MIN_IVR           = 30.0
+MAX_VIX           = 35.0
+SMA_PERIOD        = 20
+
+# Timing
+ENTRY_HOUR_START, ENTRY_MIN_START =  9, 45
+ENTRY_HOUR_END,   ENTRY_MIN_END   = 15, 30
+SUMMARY_HOUR,     SUMMARY_MIN     = 15, 35
+
+# Files
+POSITIONS_FILE = os.path.join(_DIR, 'credit_spread_positions.json')
+WEEKLY_FILE    = os.path.join(_DIR, 'credit_spread_state.json')
+TRADE_LOG_FILE = os.path.join(_DIR, 'credit_spread_trade_log.json')
+SCAN_LOG_FILE  = os.path.join(_DIR, 'credit_spread_log.json')
+LOG_MAX        = 500
+
+
+# ── ALPACA HEADERS ─────────────────────────────────────────────────────────────
+
+def _headers():
+    return {
+        'APCA-API-KEY-ID':     ALPACA_KEY,
+        'APCA-API-SECRET-KEY': ALPACA_SECRET,
+        'Content-Type':        'application/json',
+    }
+
+
+def _data_headers():
+    return {
+        'APCA-API-KEY-ID':     ALPACA_KEY,
+        'APCA-API-SECRET-KEY': ALPACA_SECRET,
+    }
+
+
+# ── MARKET HOURS ───────────────────────────────────────────────────────────────
+
+def is_market_hours():
+    now = datetime.now(ET)
+    if now.weekday() >= 5:
+        return False
+    open_t  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_t <= now <= close_t
+
+
+def _in_entry_window():
+    now  = datetime.now(ET)
+    mins = now.hour * 60 + now.minute
+    return (ENTRY_HOUR_START * 60 + ENTRY_MIN_START) <= mins <= (ENTRY_HOUR_END * 60 + ENTRY_MIN_END)
+
+
+def _is_summary_time():
+    now = datetime.now(ET)
+    return now.hour == SUMMARY_HOUR and now.minute >= SUMMARY_MIN
+
+
+# ── DISCORD ────────────────────────────────────────────────────────────────────
+
+def _discord(msg):
+    """Rate-limit-aware Discord post. ACTIVE-gated."""
+    if not ACTIVE:
+        return
+    if not DISCORD_WEBHOOK:
+        print(f'[Discord] {msg}')
+        return
+    for attempt in range(3):
+        try:
+            r = requests.post(DISCORD_WEBHOOK, json={'content': msg}, timeout=10)
+            if r.status_code == 429:
+                wait = float((r.json() if r.content else {}).get('retry_after', 1.0))
+                print(f'Discord 429, retrying in {wait:.1f}s …')
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return
+        except Exception as e:
+            print(f'Discord error (attempt {attempt + 1}/3): {e}')
+            if attempt < 2:
+                time.sleep(1)
+
+
+# ── LOGGING ────────────────────────────────────────────────────────────────────
+
+def _log(entry):
+    """Rolling 500-entry scan log. Always runs regardless of ACTIVE."""
+    try:
+        try:
+            with open(SCAN_LOG_FILE) as f:
+                log = json.load(f)
+        except Exception:
+            log = []
+        log.append(entry)
+        if len(log) > LOG_MAX:
+            log = log[-LOG_MAX:]
+        with open(SCAN_LOG_FILE, 'w') as f:
+            json.dump(log, f, indent=2, default=str)
+    except Exception as e:
+        print(f'  [_log] write failed: {e}')
+
+
+def _log_trade(entry):
+    """Permanent trade history — never truncated."""
+    try:
+        try:
+            with open(TRADE_LOG_FILE) as f:
+                log = json.load(f)
+        except Exception:
+            log = []
+        log.append(entry)
+        with open(TRADE_LOG_FILE, 'w') as f:
+            json.dump(log, f, indent=2, default=str)
+    except Exception as e:
+        print(f'  [_log_trade] write failed: {e}')
+
+
+# ── POSITIONS STATE ────────────────────────────────────────────────────────────
+# credit_spread_positions.json
+# Schema: {"positions": [...], "daily_summary_sent": null | "YYYY-MM-DD"}
+
+def _load_positions():
+    try:
+        with open(POSITIONS_FILE) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and 'positions' in d:
+            return d
+    except Exception:
+        pass
+    return {'positions': [], 'daily_summary_sent': None}
+
+
+def _save_positions(ps):
+    try:
+        with open(POSITIONS_FILE, 'w') as f:
+            json.dump(ps, f, indent=2, default=str)
+    except Exception as e:
+        print(f'  [_save_positions] failed: {e}')
+
+
+# ── WEEKLY STATE ───────────────────────────────────────────────────────────────
+# credit_spread_state.json — persists across Railway restarts independently.
+# Schema: {"weekly_realized_loss": float, "cooldown_active": bool, "week_start_date": "YYYY-MM-DD"}
+#
+# weekly_realized_loss tracks net loss this week (wins reduce it, losses grow it).
+# Cooldown triggers when weekly_realized_loss >= WEEKLY_LOSS_LIMIT ($1,000).
+# Resets automatically every Monday.
+
+def _this_monday():
+    today = date.today()
+    return (today - timedelta(days=today.weekday())).isoformat()
+
+
+def _empty_weekly():
+    return {
+        'weekly_realized_loss': 0.0,
+        'cooldown_active':      False,
+        'week_start_date':      _this_monday(),
+    }
+
+
+def _load_weekly():
+    try:
+        with open(WEEKLY_FILE) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and 'week_start_date' in d:
+            return d
+    except Exception:
+        pass
+    return _empty_weekly()
+
+
+def _save_weekly(w):
+    try:
+        with open(WEEKLY_FILE, 'w') as f:
+            json.dump(w, f, indent=2, default=str)
+    except Exception as e:
+        print(f'  [_save_weekly] failed: {e}')
+
+
+def _reset_weekly_if_needed(w):
+    monday = _this_monday()
+    if w.get('week_start_date') != monday:
+        print(f'  [weekly reset] New week {monday} — loss and cooldown cleared')
+        w = _empty_weekly()
+        _save_weekly(w)
+    return w
+
+
+# ── FILE INIT ──────────────────────────────────────────────────────────────────
+
+def _init_files():
+    defaults = [
+        (POSITIONS_FILE, {'positions': [], 'daily_summary_sent': None}),
+        (WEEKLY_FILE,    _empty_weekly()),
+        (TRADE_LOG_FILE, []),
+        (SCAN_LOG_FILE,  []),
+    ]
+    for path, empty in defaults:
+        if not os.path.exists(path):
+            with open(path, 'w') as f:
+                json.dump(empty, f, indent=2)
+            print(f'[init] Created {os.path.basename(path)}')
+
+
+# ── STARTUP RECONCILIATION ─────────────────────────────────────────────────────
+
+def _reconcile_on_startup():
+    """
+    Load state files, log what we found, and return (pos_state, weekly).
+    Any positions already in credit_spread_positions.json are immediately active
+    for monitoring on the first scan — no Alpaca call needed at this stage.
+    """
+    pos_state = _load_positions()
+    weekly    = _load_weekly()
+    weekly    = _reset_weekly_if_needed(weekly)
+    now_str   = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
+
+    positions = pos_state.get('positions', [])
+    if positions:
+        labels = [
+            f'{p.get("short_strike", 0):.0f}/{p.get("long_strike", 0):.0f}P '
+            f'exp={p.get("expiration", "?")}  credit=${p.get("credit", 0):.2f}'
+            for p in positions
+        ]
+        print(f'[startup] Resumed {len(positions)} open position(s):')
+        for lbl in labels:
+            print(f'  {lbl}')
+        _log({'timestamp': now_str, 'event': 'STARTUP_RESUME',
+              'positions': len(positions), 'labels': labels})
+    else:
+        print('[startup] No open positions found — starting clean.')
+        _log({'timestamp': now_str, 'event': 'STARTUP_CLEAN'})
+
+    print(f'[startup] Weekly loss: ${weekly["weekly_realized_loss"]:.2f}  '
+          f'cooldown: {weekly["cooldown_active"]}  '
+          f'week_start: {weekly["week_start_date"]}')
+
+    return pos_state, weekly
+
+
+# ── MARKET DATA ────────────────────────────────────────────────────────────────
+
+def _flatten_columns(df):
+    """Handle MultiIndex columns returned by yfinance >=0.2 for single-ticker downloads."""
+    if hasattr(df.columns, 'levels'):
+        try:
+            df.columns = df.columns.droplevel(1)
+        except Exception:
+            pass
+    return df
+
+
+def _spy_price():
+    """Current SPY mid-price from Alpaca IEX feed."""
+    try:
+        r = requests.get(
+            f'{DATA_URL}/v2/stocks/SPY/quotes/latest',
+            headers=_data_headers(),
+            params={'feed': 'iex'},
+            timeout=10,
+        )
+        r.raise_for_status()
+        q   = r.json().get('quote', {})
+        bid = float(q.get('bp') or 0)
+        ask = float(q.get('ap') or 0)
+        if bid > 0 and ask > 0:
+            return round((bid + ask) / 2, 4)
+        r2 = requests.get(
+            f'{DATA_URL}/v2/stocks/SPY/trades/latest',
+            headers=_data_headers(),
+            params={'feed': 'iex'},
+            timeout=10,
+        )
+        r2.raise_for_status()
+        return float(r2.json()['trade']['p'])
+    except Exception as e:
+        print(f'  [spy_price] {e}')
+        return None
+
+
+def _spy_above_sma20():
+    """Return (above_sma: bool|None, spy_close: float|None, sma: float|None)."""
+    try:
+        df = yf.download('SPY', period='40d', interval='1d',
+                         progress=False, auto_adjust=True)
+        if df.empty:
+            return None, None, None
+        df     = _flatten_columns(df)
+        closes = df['Close'].dropna().values
+        if len(closes) < SMA_PERIOD:
+            return None, None, None
+        sma     = float(closes[-SMA_PERIOD:].mean())
+        current = float(closes[-1])
+        return current > sma, current, sma
+    except Exception as e:
+        print(f'  [sma20] {e}')
+        return None, None, None
+
+
+def _vix_ivrank():
+    """Return (ivr_pct: float|None, vix: float|None). IVR = 252-day percentile."""
+    try:
+        df = yf.download('^VIX', period=f'{VIX_IVR_WINDOW + 60}d',
+                         interval='1d', progress=False, auto_adjust=False)
+        if df.empty:
+            return None, None
+        df          = _flatten_columns(df)
+        closes      = df['Close'].dropna().values
+        if len(closes) < 2:
+            return None, None
+        window      = closes[-VIX_IVR_WINDOW:] if len(closes) >= VIX_IVR_WINDOW else closes
+        current_vix = float(closes[-1])
+        ivr         = float((window < current_vix).sum()) / len(window) * 100
+        return round(ivr, 1), round(current_vix, 2)
+    except Exception as e:
+        print(f'  [vix_ivrank] {e}')
+        return None, None
+
+
+# ── OPTIONS CHAIN ──────────────────────────────────────────────────────────────
+
+def _find_target_expiration():
+    """Return SPY expiry closest to TARGET_DTE. Widens to 5–10 DTE if needed."""
+    try:
+        expirations = yf.Ticker('SPY').options
+        if not expirations:
+            return None
+        today     = date.today()
+        best      = None
+        best_diff = float('inf')
+        for exp_str in expirations:
+            exp = date.fromisoformat(exp_str)
+            dte = (exp - today).days
+            if DTE_MIN <= dte <= DTE_MAX:
+                diff = abs(dte - TARGET_DTE)
+                if diff < best_diff:
+                    best, best_diff = exp, diff
+        if best:
+            return best
+        for exp_str in expirations:
+            exp = date.fromisoformat(exp_str)
+            dte = (exp - today).days
+            if 5 <= dte <= 10:
+                diff = abs(dte - TARGET_DTE)
+                if diff < best_diff:
+                    best, best_diff = exp, diff
+        return best
+    except Exception as e:
+        print(f'  [find_expiry] {e}')
+        return None
+
+
+def _fetch_options_chain(expiry, now_str):
+    """
+    Fetch SPY put chain for expiry from Alpaca v2 REST API.
+    Returns dict {symbol: {strike, bid, ask, mid, delta, iv}} or None on any failure.
+    All failure modes are logged to credit_spread_log.json and return None — never raise.
+    """
+    try:
+        r = requests.get(
+            f'{DATA_URL}/v2/options/contracts',
+            headers=_data_headers(),
+            params={
+                'underlying_symbols': 'SPY',
+                'type':               'put',
+                'expiration_date':    expiry.isoformat(),
+                'limit':              200,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        contracts = r.json().get('option_contracts', [])
+        if not contracts:
+            reason = f'no contracts returned by Alpaca for expiry {expiry}'
+            print(f'  [chain] {reason}')
+            _log({'timestamp': now_str, 'event': 'CHAIN_EMPTY', 'expiry': str(expiry),
+                  'reason': reason})
+            return None
+
+        symbols    = [c['symbol'] for c in contracts]
+        strike_map = {c['symbol']: float(c['strike_price']) for c in contracts}
+
+        chain = {}
+        for batch_start in range(0, len(symbols), 100):
+            batch = symbols[batch_start:batch_start + 100]
+            try:
+                rs = requests.get(
+                    f'{DATA_URL}/v2/options/snapshots',
+                    headers=_data_headers(),
+                    params={'symbols': ','.join(batch), 'feed': 'indicative'},
+                    timeout=15,
+                )
+                rs.raise_for_status()
+                for sym, snap in rs.json().get('snapshots', {}).items():
+                    q   = snap.get('latestQuote', {})
+                    bid = float(q.get('bp') or 0)
+                    ask = float(q.get('ap') or 0)
+                    mid = round((bid + ask) / 2, 4) if (bid + ask) > 0 else 0.0
+                    g   = snap.get('greeks') or {}
+                    chain[sym] = {
+                        'strike': strike_map.get(sym, 0.0),
+                        'bid':    bid,
+                        'ask':    ask,
+                        'mid':    mid,
+                        'delta':  float(g['delta']) if g.get('delta') is not None else None,
+                        'iv':     snap.get('impliedVolatility'),
+                    }
+            except Exception as e:
+                reason = f'snapshot batch error: {type(e).__name__}: {e}'
+                print(f'  [chain] {reason}')
+                _log({'timestamp': now_str, 'event': 'CHAIN_BATCH_ERROR', 'reason': reason})
+
+        if not chain:
+            reason = 'all snapshot batches returned empty'
+            print(f'  [chain] {reason}')
+            _log({'timestamp': now_str, 'event': 'CHAIN_EMPTY', 'expiry': str(expiry),
+                  'reason': reason})
+            return None
+
+        return chain
+
+    except Exception as e:
+        reason = f'{type(e).__name__}: {e}'
+        print(f'  [chain] fetch failed: {reason}')
+        _log({'timestamp': now_str, 'event': 'CHAIN_FETCH_ERROR', 'expiry': str(expiry),
+              'reason': reason})
+        return None
+
+
+def _bs_put_delta(S, K, T_years, sigma):
+    """Black-Scholes European put delta in [-1, 0]. Returns None on error."""
+    try:
+        if T_years <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return -1.0 if K > S else 0.0
+        d1 = (math.log(S / K) + (RISK_FREE_RATE + 0.5 * sigma ** 2) * T_years) / (
+            sigma * math.sqrt(T_years)
+        )
+        return norm.cdf(d1) - 1.0
+    except Exception:
+        return None
+
+
+def _find_short_strike(chain, spy_px, expiry, vix, now_str):
+    """
+    Find OTM put with |delta| closest to TARGET_DELTA (0.20).
+
+    Delta priority per contract:
+      1. Alpaca greeks.delta  (most accurate)
+      2. Per-contract impliedVolatility via Black-Scholes
+      3. VIX / 100 via Black-Scholes  (last resort)
+
+    Rejects result if best |delta| is > DELTA_TOLERANCE (0.05) from target.
+    Returns (symbol, strike, delta) or (None, None, None).
+    """
+    T_years        = max((expiry - date.today()).days / 365.0, 1 / 365)
+    sigma_fallback = (vix or 20.0) / 100.0
+
+    best_sym, best_strike, best_delta = None, None, None
+    best_diff = float('inf')
+    bs_used = bs_failed = 0
+
+    for sym, data in chain.items():
+        strike = data['strike']
+        if strike <= 0 or data['mid'] <= 0 or strike >= spy_px:
+            continue  # skip zero-mid and ITM puts
+
+        delta = data['delta']
+        if delta is None:
+            per_iv = data.get('iv')
+            sigma  = float(per_iv) if per_iv else sigma_fallback
+            delta  = _bs_put_delta(spy_px, strike, T_years, sigma)
+            if delta is not None:
+                bs_used += 1
+            else:
+                bs_failed += 1
+                continue
+
+        diff = abs(abs(delta) - TARGET_DELTA)
+        if diff < best_diff:
+            best_diff, best_sym, best_strike, best_delta = diff, sym, strike, delta
+
+    if bs_used or bs_failed:
+        print(f'  [chain] BS fallback: {bs_used} used, {bs_failed} failed')
+
+    if best_sym is None:
+        reason = 'no OTM puts with computable delta in chain'
+        print(f'  [chain] {reason}')
+        _log({'timestamp': now_str, 'event': 'CHAIN_NO_DELTA', 'reason': reason})
+        return None, None, None
+
+    if best_diff > DELTA_TOLERANCE:
+        reason = (f'closest delta={abs(best_delta):.3f} at ${best_strike:.0f} is '
+                  f'{best_diff:.3f} from target {TARGET_DELTA} '
+                  f'(tolerance {DELTA_TOLERANCE})')
+        print(f'  [chain] {reason}')
+        _log({'timestamp': now_str, 'event': 'CHAIN_DELTA_TOO_FAR',
+              'reason': reason, 'best_strike': best_strike,
+              'best_delta': round(best_delta, 4)})
+        return None, None, None
+
+    return best_sym, best_strike, best_delta
+
+
+def _find_long_symbol(chain, short_strike):
+    """Find option symbol for the long leg (short_strike − SPREAD_WIDTH)."""
+    target    = short_strike - SPREAD_WIDTH
+    best_sym  = best_k = None
+    best_diff = float('inf')
+    for sym, data in chain.items():
+        diff = abs(data['strike'] - target)
+        if diff < best_diff:
+            best_diff, best_sym, best_k = diff, sym, data['strike']
+    return best_sym, best_k
+
+
+def _spread_mid(chain, short_sym, long_sym):
+    """Net credit = short_mid − long_mid. Returns None if data missing or degenerate."""
+    try:
+        s_mid = chain[short_sym]['mid']
+        l_mid = chain[long_sym]['mid']
+        if s_mid <= 0 or l_mid < 0:
+            return None
+        return round(s_mid - l_mid, 4)
+    except (KeyError, TypeError):
+        return None
+
+
+# ── SPREAD VALUE FOR MONITORING ────────────────────────────────────────────────
+
+def _current_cost_to_close(short_sym, long_sym):
+    """
+    Current debit to close = short_mid − long_mid.
+    Positive = we pay to close (normal for a short spread). Returns None on error.
+    """
+    try:
+        rs = requests.get(
+            f'{DATA_URL}/v2/options/snapshots',
+            headers=_data_headers(),
+            params={'symbols': f'{short_sym},{long_sym}', 'feed': 'indicative'},
+            timeout=10,
+        )
+        rs.raise_for_status()
+        snaps = rs.json().get('snapshots', {})
+
+        def _mid(sym):
+            q   = snaps.get(sym, {}).get('latestQuote', {})
+            bid = float(q.get('bp') or 0)
+            ask = float(q.get('ap') or 0)
+            return (bid + ask) / 2.0 if (bid + ask) > 0 else None
+
+        s = _mid(short_sym)
+        l = _mid(long_sym)
+        if s is None or l is None:
+            return None
+        return round(s - l, 4)
+    except Exception as e:
+        print(f'  [cost_to_close] {e}')
+        return None
+
+
+# ── ORDER MANAGEMENT ───────────────────────────────────────────────────────────
+# No Alpaca SDK. Uses Alpaca v2 REST API via requests==2.32.5.
+# Multi-leg spread orders: POST /v2/orders with order_class='mleg'.
+# Leg fields: symbol, side, ratio_qty, position_intent.
+
+def _place_open_order(short_sym, long_sym, credit):
+    """Limit order to open the credit spread. ACTIVE-gated."""
+    if not ACTIVE:
+        return None
+    try:
+        payload = {
+            'qty':           '1',
+            'type':          'limit',
+            'time_in_force': 'day',
+            'order_class':   'mleg',
+            'limit_price':   str(round(credit, 2)),
+            'legs': [
+                {'symbol': short_sym, 'side': 'sell',
+                 'ratio_qty': '1', 'position_intent': 'sell_to_open'},
+                {'symbol': long_sym,  'side': 'buy',
+                 'ratio_qty': '1', 'position_intent': 'buy_to_open'},
+            ],
+        }
+        r = requests.post(f'{PAPER_BASE_URL}/v2/orders',
+                          headers=_headers(), json=payload, timeout=15)
+        r.raise_for_status()
+        return r.json().get('id')
+    except Exception as e:
+        print(f'  [place_open] {e}')
+        return None
+
+
+def _place_close_order(short_sym, long_sym, order_type='market', limit_price=None):
+    """Order to close the spread. ACTIVE-gated. order_type: 'market' | 'limit'."""
+    if not ACTIVE:
+        return None
+    try:
+        payload = {
+            'qty':           '1',
+            'type':          order_type,
+            'time_in_force': 'day',
+            'order_class':   'mleg',
+            'legs': [
+                {'symbol': short_sym, 'side': 'buy',
+                 'ratio_qty': '1', 'position_intent': 'buy_to_close'},
+                {'symbol': long_sym,  'side': 'sell',
+                 'ratio_qty': '1', 'position_intent': 'sell_to_close'},
+            ],
+        }
+        if order_type == 'limit' and limit_price is not None:
+            payload['limit_price'] = str(round(limit_price, 2))
+        r = requests.post(f'{PAPER_BASE_URL}/v2/orders',
+                          headers=_headers(), json=payload, timeout=15)
+        r.raise_for_status()
+        return r.json().get('id')
+    except Exception as e:
+        print(f'  [place_close] {e}')
+        return None
+
+
+def _get_order(order_id):
+    try:
+        r = requests.get(f'{PAPER_BASE_URL}/v2/orders/{order_id}',
+                         headers=_headers(), timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f'  [get_order] {e}')
+        return None
+
+
+def _cancel_order(order_id):
+    if not ACTIVE:
+        return
+    try:
+        r = requests.delete(f'{PAPER_BASE_URL}/v2/orders/{order_id}',
+                            headers=_headers(), timeout=10)
+        if r.status_code not in (200, 204):
+            print(f'  [cancel_order] status {r.status_code}')
+    except Exception as e:
+        print(f'  [cancel_order] {e}')
+
+
+# ── ENTRY EXECUTION ────────────────────────────────────────────────────────────
+
+def _attempt_entry(pos_state, weekly, now_str, short_sym, long_sym,
+                   short_strike, long_strike, expiry, credit, spy_px, short_delta):
+    """
+    Place opening order, poll for fill up to ORDER_FILL_TIMEOUT seconds.
+    Updates pos_state['positions'] in place on fill.
+    Returns True if filled. ACTIVE-gated.
+    """
+    if not ACTIVE:
+        return False
+
+    order_id = _place_open_order(short_sym, long_sym, credit)
+    if not order_id:
+        _log({'timestamp': now_str, 'event': 'ORDER_PLACE_FAILED',
+              'short': short_sym, 'long': long_sym, 'credit': credit})
+        print('  [entry] order placement failed')
+        return False
+
+    print(f'  [entry] order {order_id} placed — polling fill (max {ORDER_FILL_TIMEOUT}s)…')
+    deadline = time.time() + ORDER_FILL_TIMEOUT
+
+    while time.time() < deadline:
+        time.sleep(30)
+        order = _get_order(order_id)
+        if order is None:
+            continue
+        status = order.get('status', '')
+
+        if status == 'filled':
+            fill_credit = float(order.get('filled_avg_price') or credit)
+            max_risk    = round((SPREAD_WIDTH - fill_credit) * 100, 2)
+            breakeven   = round(short_strike - fill_credit, 2)
+            pos = {
+                'short_symbol':   short_sym,
+                'long_symbol':    long_sym,
+                'short_strike':   short_strike,
+                'long_strike':    long_strike,
+                'expiration':     expiry.isoformat(),
+                'credit':         round(fill_credit, 4),
+                'max_risk':       max_risk,
+                'breakeven':      breakeven,
+                'profit_target':  round(fill_credit * PROFIT_TARGET_PCT, 4),
+                'stop_loss_cost': round(fill_credit * STOP_LOSS_PCT, 4),
+                'open_time':      now_str,
+                'entry_order_id': order_id,
+                'short_delta':    round(short_delta, 4) if short_delta else None,
+                'spy_entry_px':   spy_px,
+            }
+            pos_state['positions'].append(pos)
+            _save_positions(pos_state)
+            _log({'timestamp': now_str, 'event': 'ENTRY_FILLED', **pos})
+            _log_trade({'timestamp': now_str, 'type': 'OPEN', **pos})
+            _discord(
+                f'🟢 CREDIT SPREAD OPEN | '
+                f'SPY {short_strike:.0f}/{long_strike:.0f}P  exp {expiry} | '
+                f'Credit: ${fill_credit:.2f} | Max risk: ${max_risk:.2f} | '
+                f'Breakeven: ${breakeven:.2f} | '
+                f'Positions open: {len(pos_state["positions"])}'
+            )
+            print(f'  [entry] FILLED ${fill_credit:.2f}  {short_sym} / {long_sym}')
+            return True
+
+        if status in ('cancelled', 'expired', 'rejected', 'done_for_day'):
+            print(f'  [entry] order {status} — no fill')
+            _log({'timestamp': now_str, 'event': f'ORDER_{status.upper()}',
+                  'order_id': order_id})
+            return False
+
+    print(f'  [entry] fill timeout ({ORDER_FILL_TIMEOUT}s) — cancelling {order_id}')
+    _cancel_order(order_id)
+    _log({'timestamp': now_str, 'event': 'ENTRY_FILL_TIMEOUT', 'order_id': order_id})
+    return False
+
+
+# ── POSITION MONITORING ────────────────────────────────────────────────────────
+
+def _record_exit(pos_state, weekly, pos, reason, close_cost, now_str):
+    """
+    Log exit, update weekly_realized_loss, fire Discord.
+    Does NOT remove pos from pos_state — caller handles that and saves both files.
+
+    weekly_realized_loss tracks net loss this week:
+      loss trade  → loss grows  (pnl negative, -pnl positive)
+      win  trade  → loss shrinks (pnl positive, -pnl negative), floored at 0
+    """
+    credit  = pos['credit']
+    pnl     = round((credit - close_cost) * 100, 2)   # 100 multiplier per contract
+    label   = f'SPY {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P {pos["expiration"]}'
+
+    old_loss = weekly.get('weekly_realized_loss', 0.0)
+    new_loss = round(max(0.0, old_loss - pnl), 2)
+    weekly['weekly_realized_loss'] = new_loss
+
+    exit_entry = {
+        'timestamp':            now_str,
+        'type':                 'CLOSE',
+        'event':                'EXIT',
+        'reason':               reason,
+        'label':                label,
+        'short_symbol':         pos['short_symbol'],
+        'long_symbol':          pos['long_symbol'],
+        'expiration':           pos['expiration'],
+        'credit':               credit,
+        'close_cost':           close_cost,
+        'pnl':                  pnl,
+        'weekly_realized_loss': new_loss,
+    }
+    _log(exit_entry)
+    _log_trade(exit_entry)
+
+    reason_labels = {
+        'PROFIT_TARGET': 'profit target',
+        'STOP_LOSS':     'stop loss',
+        'EXPIRATION':    'expiration close',
+    }
+    pnl_str = f'+${pnl:.2f}' if pnl >= 0 else f'-${abs(pnl):.2f}'
+    _discord(
+        f'{"✅" if pnl >= 0 else "🔴"} SPREAD CLOSED '
+        f'({reason_labels.get(reason, reason)}) | '
+        f'{label} | '
+        f'Credit: ${credit:.2f}  Close: ${close_cost:.4f} | '
+        f'P&L: {pnl_str} | '
+        f'Week loss: ${new_loss:.2f} / ${WEEKLY_LOSS_LIMIT:.0f}'
+    )
+
+    if new_loss >= WEEKLY_LOSS_LIMIT and not weekly.get('cooldown_active'):
+        weekly['cooldown_active'] = True
+        _discord(
+            f'🚨 WEEKLY LOSS LIMIT HIT — ${new_loss:.2f} in net losses this week. '
+            f'No new entries until Monday.'
+        )
+        _log({'timestamp': now_str, 'event': 'WEEKLY_LOSS_COOLDOWN',
+              'weekly_realized_loss': new_loss})
+        print(f'  [weekly limit] COOLDOWN activated — week loss ${new_loss:.2f}')
+
+
+def _monitor_positions(pos_state, weekly, now_str):
+    """
+    Check all open positions for profit target / stop loss / expiration close.
+    ACTIVE-gated. Modifies pos_state['positions'] in place; saves both files on any change.
+
+    Isolation from paper_execution.py:
+      - paper_execution.py manages equity positions via position_state.json.
+      - Its reconcile_positions_on_startup() filters asset_class != 'us_equity' AND
+        requires symbol in TICKERS (['SPY','QQQ','AAPL','NVDA','TSLA'] — raw equity symbols).
+        OCC option symbols (e.g. 'SPY250703P00575000') can never pass that filter.
+      - No state file is shared between the two systems.
+    """
+    if not ACTIVE:
+        return
+
+    positions = pos_state.get('positions', [])
+    if not positions:
+        return
+
+    today    = date.today()
+    now_et   = datetime.now(ET)
+    to_close = []
+
+    for pos in positions:
+        short_sym = pos['short_symbol']
+        long_sym  = pos['long_symbol']
+        expiry    = date.fromisoformat(pos['expiration'])
+        credit    = pos['credit']
+        label     = f'SPY {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P {expiry}'
+
+        try:
+            # ── Expiration force-close (9:45am ET on expiry day) ─────────────
+            if today == expiry and now_et.hour == 9 and now_et.minute >= 45:
+                print(f'  {label}: EXPIRATION CLOSE')
+                cost = _current_cost_to_close(short_sym, long_sym) or 0.0
+                ok   = _place_close_order(short_sym, long_sym, order_type='market')
+                if ok:
+                    _record_exit(pos_state, weekly, pos, 'EXPIRATION', cost, now_str)
+                    to_close.append(pos)
+                    _log({'timestamp': now_str, 'event': 'MONITOR_EXPIRY_CLOSE',
+                          'label': label, 'close_cost': cost})
+                continue
+
+            # ── Current spread value ──────────────────────────────────────────
+            cost = _current_cost_to_close(short_sym, long_sym)
+            if cost is None:
+                print(f'  {label}: value unavailable — skipping this cycle')
+                _log({'timestamp': now_str, 'event': 'MONITOR_VALUE_UNAVAILABLE',
+                      'label': label})
+                continue
+
+            print(f'  {label}: cost={cost:.4f}  credit={credit:.4f}  '
+                  f'tgt≤{pos["profit_target"]:.4f}  stop≥{pos["stop_loss_cost"]:.4f}')
+
+            # ── Profit target: cost ≤ 50% of original credit ─────────────────
+            if cost <= pos['profit_target']:
+                print(f'  {label}: PROFIT TARGET')
+                ok = _place_close_order(short_sym, long_sym,
+                                        order_type='limit',
+                                        limit_price=pos['profit_target'])
+                if ok:
+                    _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET', cost, now_str)
+                    to_close.append(pos)
+                continue
+
+            # ── Stop loss: cost ≥ 200% of original credit ────────────────────
+            if cost >= pos['stop_loss_cost']:
+                print(f'  {label}: STOP LOSS')
+                ok = _place_close_order(short_sym, long_sym, order_type='market')
+                if ok:
+                    _record_exit(pos_state, weekly, pos, 'STOP_LOSS', cost, now_str)
+                    to_close.append(pos)
+
+        except Exception as e:
+            print(f'  {label}: MONITOR ERROR — {type(e).__name__}: {e}')
+            _log({'timestamp': now_str, 'event': 'MONITOR_POSITION_ERROR',
+                  'label': label, 'error': f'{type(e).__name__}: {e}'})
+
+    if to_close:
+        for pos in to_close:
+            try:
+                pos_state['positions'].remove(pos)
+            except ValueError:
+                pass
+        _save_positions(pos_state)
+        _save_weekly(weekly)
+
+
+# ── ENTRY CONDITIONS ───────────────────────────────────────────────────────────
+
+def _check_entry_conditions(pos_state, weekly):
+    """
+    Evaluate all gates cheapest-first. Short-circuits on first group failure.
+    Returns (all_passed: bool, conditions: dict, spy_px, ivr, vix).
+    """
+    conds  = {}
+    spy_px = ivr = vix = None
+
+    def _c(name, passed, detail):
+        conds[name] = {'passed': bool(passed), 'detail': str(detail)}
+
+    # Cheap gates first (no API calls)
+    _c('active',          ACTIVE,
+       'True' if ACTIVE else 'False — DORMANT')
+    _c('entry_window',    _in_entry_window(),
+       '9:45–3:30 ET')
+    _c('position_limit',  len(pos_state.get('positions', [])) < MAX_POSITIONS,
+       f'{len(pos_state.get("positions", []))}/{MAX_POSITIONS} open')
+    _c('weekly_cooldown', not weekly.get('cooldown_active', False),
+       f'loss=${weekly.get("weekly_realized_loss", 0):.2f} / ${WEEKLY_LOSS_LIMIT:.0f}')
+
+    if not all(v['passed'] for v in conds.values()):
+        return False, conds, spy_px, ivr, vix
+
+    # SPY SMA filter
+    above_sma, spy_close, sma_val = _spy_above_sma20()
+    spy_px = spy_close
+    if above_sma is None:
+        _c('spy_above_sma', False, 'data unavailable')
+    else:
+        _c('spy_above_sma', above_sma,
+           f'SPY={spy_close:.2f}  SMA20={sma_val:.2f}  '
+           f'{"above" if above_sma else "BELOW"}')
+
+    if not all(v['passed'] for v in conds.values()):
+        return False, conds, spy_px, ivr, vix
+
+    # IV rank + VIX cap
+    ivr, vix = _vix_ivrank()
+    if ivr is None:
+        _c('iv_rank', False, 'VIX data unavailable')
+        _c('vix_cap',  False, 'VIX data unavailable')
+    else:
+        _c('iv_rank', ivr >= MIN_IVR,
+           f'IVR={ivr:.1f}% (need ≥{MIN_IVR}%) — VIX={vix:.2f}')
+        _c('vix_cap',  vix < MAX_VIX,
+           f'VIX={vix:.2f} {"<" if vix < MAX_VIX else "≥"} {MAX_VIX}')
+
+    return all(v['passed'] for v in conds.values()), conds, spy_px, ivr, vix
+
+
+# ── DAILY SUMMARY ──────────────────────────────────────────────────────────────
+
+def _check_daily_summary(pos_state, weekly, now_str):
+    """Send once-daily summary at 3:35pm ET. ACTIVE-gated."""
+    if not ACTIVE:
+        return
+    today_str = date.today().isoformat()
+    if pos_state.get('daily_summary_sent') == today_str:
+        return
+    if not _is_summary_time():
+        return
+
+    pos_state['daily_summary_sent'] = today_str
+    _save_positions(pos_state)
+
+    n_pos     = len(pos_state.get('positions', []))
+    week_loss = weekly.get('weekly_realized_loss', 0.0)
+
+    try:
+        with open(TRADE_LOG_FILE) as f:
+            tlog = json.load(f)
+        today_closes = [t for t in tlog
+                        if t.get('type') == 'CLOSE'
+                        and str(t.get('timestamp', '')).startswith(today_str)]
+        daily_pnl    = sum(t.get('pnl', 0) for t in today_closes)
+        trades_today = len(today_closes)
+    except Exception:
+        daily_pnl = trades_today = 0
+
+    pos_detail = ''
+    for pos in pos_state.get('positions', []):
+        pos_detail += (
+            f'\n  {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P '
+            f'exp={pos["expiration"]}  credit=${pos["credit"]:.2f}'
+        )
+
+    _discord(
+        f'📊 **Credit Spread Daily Summary**\n'
+        f'Open positions: {n_pos}{pos_detail}\n'
+        f'Trades today: {trades_today}  |  Daily P&L: ${daily_pnl:+.2f}\n'
+        f'Week-to-date loss: ${week_loss:.2f} / ${WEEKLY_LOSS_LIMIT:.0f} limit'
+    )
+
+
+# ── MAIN SCAN ──────────────────────────────────────────────────────────────────
+
+def run_scan():
+    if not is_market_hours():
+        print(f'[{datetime.now(ET).strftime("%H:%M ET")}] '
+              f'Credit spread: outside market hours, skipping.')
+        return
+
+    now_str = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
+    print(f'\n[{now_str}] Credit spread scan  (ACTIVE={ACTIVE})…')
+
+    pos_state = _load_positions()
+    weekly    = _load_weekly()
+    weekly    = _reset_weekly_if_needed(weekly)
+
+    # ── 1. Monitor open positions ──────────────────────────────────────────────
+    try:
+        _monitor_positions(pos_state, weekly, now_str)
+    except Exception as e:
+        print(f'  [monitor] ERROR — {type(e).__name__}: {e}')
+        _log({'timestamp': now_str, 'event': 'MONITOR_ERROR',
+              'error': f'{type(e).__name__}: {e}'})
+
+    # ── 2. Daily summary ───────────────────────────────────────────────────────
+    try:
+        _check_daily_summary(pos_state, weekly, now_str)
+    except Exception as e:
+        print(f'  [summary] ERROR — {type(e).__name__}: {e}')
+
+    # ── 3. Entry conditions ────────────────────────────────────────────────────
+    should_enter = False
+    conditions   = {}
+    spy_px = ivr = vix = chain = None
+    expiry = short_sym = long_sym = None
+    short_strike = long_strike = short_delta = credit = None
+    scan_result  = 'no_signal'
+
+    try:
+        should_enter, conditions, spy_px, ivr, vix = _check_entry_conditions(
+            pos_state, weekly
+        )
+
+        if should_enter:
+            expiry = _find_target_expiration()
+            if expiry is None:
+                should_enter = False
+                conditions['expiry_found'] = {
+                    'passed': False, 'detail': 'no valid expiration found'
+                }
+            else:
+                dte = (expiry - date.today()).days
+                conditions['expiry_found'] = {
+                    'passed': True, 'detail': f'{expiry} ({dte} DTE)'
+                }
+
+        if should_enter:
+            chain = _fetch_options_chain(expiry, now_str)
+            if chain is None:
+                should_enter = False
+                conditions['chain_fetched'] = {
+                    'passed': False, 'detail': 'chain unavailable (see CHAIN_* log event)'
+                }
+            else:
+                conditions['chain_fetched'] = {
+                    'passed': True, 'detail': f'{len(chain)} contracts'
+                }
+
+                short_sym, short_strike, short_delta = _find_short_strike(
+                    chain, spy_px, expiry, vix, now_str
+                )
+                if short_sym is None:
+                    should_enter = False
+                    conditions['short_strike'] = {
+                        'passed': False, 'detail': 'no suitable 20Δ put (see CHAIN_* log)'
+                    }
+                else:
+                    conditions['short_strike'] = {
+                        'passed': True,
+                        'detail': f'${short_strike:.0f}  delta={short_delta:.3f}'
+                    }
+
+        if should_enter:
+            long_sym, long_strike = _find_long_symbol(chain, short_strike)
+            if long_sym is None:
+                should_enter = False
+                conditions['long_strike'] = {'passed': False, 'detail': 'not found in chain'}
+            else:
+                conditions['long_strike'] = {
+                    'passed': True, 'detail': f'${long_strike:.0f}'
+                }
+
+        if should_enter:
+            credit = _spread_mid(chain, short_sym, long_sym)
+            if credit is None or credit < MIN_CREDIT:
+                should_enter = False
+                conditions['min_credit'] = {
+                    'passed': False,
+                    'detail': (f'credit=${credit:.4f} < ${MIN_CREDIT}'
+                               if credit is not None else 'mid unavailable'),
+                }
+            else:
+                conditions['min_credit'] = {
+                    'passed': True, 'detail': f'credit=${credit:.4f}'
+                }
+
+    except Exception as e:
+        print(f'  [conditions] ERROR — {type(e).__name__}: {e}')
+        _log({'timestamp': now_str, 'event': 'CONDITIONS_ERROR',
+              'error': f'{type(e).__name__}: {e}'})
+        should_enter = False
+
+    # ── 4. Execute or log DORMANT ──────────────────────────────────────────────
+    if should_enter:
+        if not ACTIVE:
+            scan_result = 'dormant_would_enter'
+            print(
+                f'  DORMANT MODE — entry skipped | '
+                f'SPY {short_strike:.0f}/{long_strike:.0f}P  '
+                f'exp={expiry}  credit=${credit:.4f}  '
+                f'delta={short_delta:.3f}'
+            )
+        else:
+            print(f'  ENTERING: SPY {short_strike:.0f}/{long_strike:.0f}P  '
+                  f'exp={expiry}  credit=${credit:.4f}')
+            filled = _attempt_entry(
+                pos_state, weekly, now_str,
+                short_sym, long_sym, short_strike, long_strike,
+                expiry, credit, spy_px, short_delta,
+            )
+            scan_result = 'entry_filled' if filled else 'entry_not_filled'
+    else:
+        fails = [k for k, v in conditions.items() if not v.get('passed')]
+        print(f'  No entry — failed: {", ".join(fails) if fails else "(no conditions)"}')
+
+    # ── 5. Log scan ────────────────────────────────────────────────────────────
+    log_entry = {
+        'timestamp':      now_str,
+        'event':          'SCAN',
+        'active':         ACTIVE,
+        'scan_result':    scan_result,
+        'open_positions': len(pos_state.get('positions', [])),
+        'weekly_loss':    weekly.get('weekly_realized_loss', 0.0),
+        'cooldown':       weekly.get('cooldown_active', False),
+        'conditions':     conditions,
+    }
+    if scan_result in ('dormant_would_enter', 'entry_filled', 'entry_not_filled'):
+        log_entry['signal'] = {
+            'short_symbol': short_sym,
+            'long_symbol':  long_sym,
+            'expiry':       str(expiry),
+            'credit':       credit,
+            'short_delta':  round(short_delta, 4) if short_delta else None,
+            'spy_px':       spy_px,
+        }
+    _log(log_entry)
+
+
+# ── ENTRY POINT ────────────────────────────────────────────────────────────────
+
+def main():
+    print('=' * 62)
+    print('  SPY PUT CREDIT SPREAD  |  7 DTE  |  20Δ / $5-wide')
+    print(f'  ACTIVE = {ACTIVE}')
+    if not ACTIVE:
+        print('  *** DORMANT — scanning and logging, NO orders placed ***')
+    print('  Alpaca v2 REST API  |  raw requests  |  no SDK')
+    print('  Scan every 15 min, 9:30–16:00 ET, Mon–Fri')
+    print('=' * 62)
+
+    _init_files()
+    _reconcile_on_startup()
+
+    schedule.every(15).minutes.do(run_scan)
+
+    if ACTIVE:
+        _discord(
+            f'✅ Credit Spread system live | SPY 7DTE put spreads | '
+            f'20Δ short / $5-wide / ${MIN_CREDIT:.2f} min credit'
+        )
+    else:
+        print('  Dormant mode: conditions evaluated and logged each scan.')
+
+    run_scan()
+
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+
+if __name__ == '__main__':
+    main()
