@@ -35,7 +35,7 @@ from scipy.stats import norm
 load_dotenv()
 
 # ── ACTIVATION FLAG ────────────────────────────────────────────────────────────
-ACTIVE = False  # Set to True to enable live order placement
+ACTIVE = True   # Set to True to enable live order placement
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK = os.getenv('DISCORD_WEBHOOK_URL')

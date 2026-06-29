@@ -1,1 +1,1 @@
-worker: python3 scanner.py
+credit_spread: python3 credit_spread_strat.py
