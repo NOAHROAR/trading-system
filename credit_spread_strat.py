@@ -268,23 +268,89 @@ def _init_files():
 
 def _reconcile_on_startup():
     """
-    Load state files, log what we found, and return (pos_state, weekly).
-    Any positions already in credit_spread_positions.json are immediately active
-    for monitoring on the first scan — no Alpaca call needed at this stage.
+    Load state files, cross-check against Alpaca open options positions, and return (pos_state, weekly).
+
+    Alpaca sync: queries /v2/positions for open SPY option legs.
+    Each tracked spread = 2 legs. Mismatch → Discord alert.
+    If Alpaca has MORE legs than the file expects, placeholder entries are added to
+    block new entries until the user manually resolves untracked positions.
+    If Alpaca has FEWER legs, we alert only (stale state entries).
     """
     pos_state = _load_positions()
     weekly    = _load_weekly()
     weekly    = _reset_weekly_if_needed(weekly)
     now_str   = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
 
+    # ── Cross-check local state against Alpaca open options positions ──────────
+    try:
+        r = requests.get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers(), timeout=10)
+        r.raise_for_status()
+        spy_option_legs = [
+            p for p in r.json()
+            if p.get('asset_class') == 'us_option'
+            and str(p.get('symbol', '')).startswith('SPY')
+        ]
+        expected_legs = len(pos_state.get('positions', [])) * 2
+        actual_legs   = len(spy_option_legs)
+
+        if actual_legs == expected_legs:
+            print(f'[reconcile] Alpaca options OK — '
+                  f'{actual_legs} leg(s) / {len(pos_state["positions"])} spread(s)')
+        else:
+            orphaned = actual_legs - expected_legs
+            direction = f'{orphaned} untracked leg(s) — new entries blocked' if orphaned > 0 \
+                        else f'{-orphaned} extra state entry(ies) — stale entries possible'
+            msg = (
+                f'⚠️ OPTIONS MISMATCH on startup | '
+                f'Alpaca: {actual_legs} SPY option leg(s), '
+                f'state file expects {expected_legs} ({len(pos_state["positions"])} spread(s)). '
+                f'{direction}. Manual review required.'
+            )
+            print(f'[reconcile] {msg}')
+            _log({'timestamp': now_str, 'event': 'RECONCILE_OPTIONS_MISMATCH',
+                  'alpaca_legs': actual_legs, 'expected_legs': expected_legs,
+                  'alpaca_symbols': [p['symbol'] for p in spy_option_legs]})
+            _discord(msg)
+
+            # Add blocker placeholders for each untracked spread (2 legs = 1 spread)
+            for _ in range(max(0, orphaned // 2)):
+                pos_state['positions'].append({
+                    'short_symbol':   'UNKNOWN',
+                    'long_symbol':    'UNKNOWN',
+                    'short_strike':   0.0,
+                    'long_strike':    0.0,
+                    'expiration':     '2099-01-01',  # far future — never triggers expiry close
+                    'credit':         0.0,
+                    'max_risk':       0.0,
+                    'breakeven':      0.0,
+                    'profit_target':  0.0,
+                    'stop_loss_cost': 999.0,         # never triggers stop
+                    'open_time':      now_str,
+                    'entry_order_id': None,
+                    'short_delta':    None,
+                    'spy_entry_px':   None,
+                    'reconciled':     True,
+                    'note':           'Untracked Alpaca position — manual close required',
+                })
+            if orphaned > 0:
+                _save_positions(pos_state)
+
+    except Exception as e:
+        print(f'[reconcile] Alpaca positions check failed (startup continues): {e}')
+        _log({'timestamp': now_str, 'event': 'RECONCILE_API_ERROR', 'error': str(e)})
+
+    # ── Log position state ─────────────────────────────────────────────────────
     positions = pos_state.get('positions', [])
+    tracked   = [p for p in positions if not p.get('reconciled')]
     if positions:
         labels = [
             f'{p.get("short_strike", 0):.0f}/{p.get("long_strike", 0):.0f}P '
             f'exp={p.get("expiration", "?")}  credit=${p.get("credit", 0):.2f}'
+            + (' [UNTRACKED]' if p.get('reconciled') else '')
             for p in positions
         ]
-        print(f'[startup] Resumed {len(positions)} open position(s):')
+        print(f'[startup] Resumed {len(tracked)} tracked + '
+              f'{len(positions) - len(tracked)} untracked position(s):')
         for lbl in labels:
             print(f'  {lbl}')
         _log({'timestamp': now_str, 'event': 'STARTUP_RESUME',
@@ -766,6 +832,16 @@ def _attempt_entry(pos_state, weekly, now_str, short_sym, long_sym,
             print(f'  [entry] FILLED ${fill_credit:.2f}  {short_sym} / {long_sym}')
             return True
 
+        if status == 'partially_filled':
+            print(f'  [entry] partial fill detected on multi-leg order — cancelling {order_id}')
+            _log({'timestamp': now_str, 'event': 'ORDER_PARTIAL_FILL', 'order_id': order_id})
+            _cancel_order(order_id)
+            _discord(
+                f'⚠️ Partial fill on spread entry order — cancelled. '
+                f'Check Alpaca for any open legs that need manual closing.'
+            )
+            return False
+
         if status in ('cancelled', 'expired', 'rejected', 'done_for_day'):
             print(f'  [entry] order {status} — no fill')
             _log({'timestamp': now_str, 'event': f'ORDER_{status.upper()}',
@@ -859,11 +935,16 @@ def _monitor_positions(pos_state, weekly, now_str):
     if not positions:
         return
 
-    today    = date.today()
+    today    = datetime.now(ET).date()   # ET date — Railway container runs in UTC
     now_et   = datetime.now(ET)
     to_close = []
 
     for pos in positions:
+        # Skip placeholder entries added by startup reconciliation for untracked Alpaca positions
+        if pos.get('reconciled') and pos.get('short_symbol') == 'UNKNOWN':
+            print(f'  [monitor] Skipping untracked reconciled position — manual review required')
+            continue
+
         short_sym = pos['short_symbol']
         long_sym  = pos['long_symbol']
         expiry    = date.fromisoformat(pos['expiration'])
@@ -881,6 +962,14 @@ def _monitor_positions(pos_state, weekly, now_str):
                     to_close.append(pos)
                     _log({'timestamp': now_str, 'event': 'MONITOR_EXPIRY_CLOSE',
                           'label': label, 'close_cost': cost})
+                else:
+                    print(f'  {label}: EXPIRY CLOSE ORDER FAILED')
+                    _log({'timestamp': now_str, 'event': 'CLOSE_ORDER_FAILED',
+                          'label': label, 'reason': 'EXPIRATION'})
+                    _discord(
+                        f'🚨 CLOSE ORDER FAILED | {label} | EXPIRATION DAY | '
+                        f'Manual close required in Alpaca immediately.'
+                    )
                 continue
 
             # ── Current spread value ──────────────────────────────────────────
@@ -903,6 +992,11 @@ def _monitor_positions(pos_state, weekly, now_str):
                 if ok:
                     _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET', cost, now_str)
                     to_close.append(pos)
+                else:
+                    print(f'  {label}: profit-target close failed — retrying next cycle')
+                    _log({'timestamp': now_str, 'event': 'CLOSE_ORDER_FAILED',
+                          'label': label, 'reason': 'PROFIT_TARGET'})
+                    _discord(f'⚠️ Close order failed | {label} | Profit target | Retrying next scan')
                 continue
 
             # ── Stop loss: cost ≥ 200% of original credit ────────────────────
@@ -912,6 +1006,11 @@ def _monitor_positions(pos_state, weekly, now_str):
                 if ok:
                     _record_exit(pos_state, weekly, pos, 'STOP_LOSS', cost, now_str)
                     to_close.append(pos)
+                else:
+                    print(f'  {label}: stop-loss close failed — retrying next cycle')
+                    _log({'timestamp': now_str, 'event': 'CLOSE_ORDER_FAILED',
+                          'label': label, 'reason': 'STOP_LOSS'})
+                    _discord(f'⚠️ Close order failed | {label} | Stop loss | Retrying next scan')
 
         except Exception as e:
             print(f'  {label}: MONITOR ERROR — {type(e).__name__}: {e}')
