@@ -95,6 +95,26 @@ def _data_headers():
     }
 
 
+def _alpaca_get(url, **kwargs):
+    """Alpaca GET with 429 backoff retry (max 3 attempts). Returns Response or None."""
+    kwargs.setdefault('timeout', 10)
+    for attempt in range(3):
+        try:
+            r = requests.get(url, **kwargs)
+            if r.status_code == 429:
+                wait = float((r.json() if r.content else {}).get('retry_after', 1.0))
+                print(f'Alpaca 429, retrying in {wait:.1f}s …')
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            print(f'Alpaca GET error (attempt {attempt + 1}/3): {e}')
+            if attempt < 2:
+                time.sleep(1)
+    return None
+
+
 # ── MARKET HOURS ───────────────────────────────────────────────────────────────
 
 def is_market_hours():
@@ -193,8 +213,10 @@ def _load_positions():
 
 def _save_positions(ps):
     try:
-        with open(POSITIONS_FILE, 'w') as f:
+        tmp = POSITIONS_FILE + '.tmp'
+        with open(tmp, 'w') as f:
             json.dump(ps, f, indent=2, default=str)
+        os.replace(tmp, POSITIONS_FILE)
     except Exception as e:
         print(f'  [_save_positions] failed: {e}')
 
@@ -208,7 +230,7 @@ def _save_positions(ps):
 # Resets automatically every Monday.
 
 def _this_monday():
-    today = date.today()
+    today = datetime.now(ET).date()
     return (today - timedelta(days=today.weekday())).isoformat()
 
 
@@ -233,8 +255,10 @@ def _load_weekly():
 
 def _save_weekly(w):
     try:
-        with open(WEEKLY_FILE, 'w') as f:
+        tmp = WEEKLY_FILE + '.tmp'
+        with open(tmp, 'w') as f:
             json.dump(w, f, indent=2, default=str)
+        os.replace(tmp, WEEKLY_FILE)
     except Exception as e:
         print(f'  [_save_weekly] failed: {e}')
 
@@ -283,8 +307,9 @@ def _reconcile_on_startup():
 
     # ── Cross-check local state against Alpaca open options positions ──────────
     try:
-        r = requests.get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers(), timeout=10)
-        r.raise_for_status()
+        r = _alpaca_get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers())
+        if r is None:
+            raise RuntimeError('positions fetch returned None after retries')
         spy_option_legs = [
             p for p in r.json()
             if p.get('asset_class') == 'us_option'
@@ -381,25 +406,25 @@ def _flatten_columns(df):
 def _spy_price():
     """Current SPY mid-price from Alpaca IEX feed."""
     try:
-        r = requests.get(
+        r = _alpaca_get(
             f'{DATA_URL}/v2/stocks/SPY/quotes/latest',
             headers=_data_headers(),
             params={'feed': 'iex'},
-            timeout=10,
         )
-        r.raise_for_status()
+        if r is None:
+            return None
         q   = r.json().get('quote', {})
         bid = float(q.get('bp') or 0)
         ask = float(q.get('ap') or 0)
         if bid > 0 and ask > 0:
             return round((bid + ask) / 2, 4)
-        r2 = requests.get(
+        r2 = _alpaca_get(
             f'{DATA_URL}/v2/stocks/SPY/trades/latest',
             headers=_data_headers(),
             params={'feed': 'iex'},
-            timeout=10,
         )
-        r2.raise_for_status()
+        if r2 is None:
+            return None
         return float(r2.json()['trade']['p'])
     except Exception as e:
         print(f'  [spy_price] {e}')
@@ -410,7 +435,7 @@ def _spy_above_sma20():
     """Return (above_sma: bool|None, spy_close: float|None, sma: float|None)."""
     try:
         df = yf.download('SPY', period='40d', interval='1d',
-                         progress=False, auto_adjust=True)
+                         progress=False, auto_adjust=True, timeout=10)
         if df.empty:
             return None, None, None
         df     = _flatten_columns(df)
@@ -429,7 +454,7 @@ def _vix_ivrank():
     """Return (ivr_pct: float|None, vix: float|None). IVR = 252-day percentile."""
     try:
         df = yf.download('^VIX', period=f'{VIX_IVR_WINDOW + 60}d',
-                         interval='1d', progress=False, auto_adjust=False)
+                         interval='1d', progress=False, auto_adjust=False, timeout=10)
         if df.empty:
             return None, None
         df          = _flatten_columns(df)
@@ -485,7 +510,7 @@ def _fetch_options_chain(expiry, now_str):
     All failure modes are logged to credit_spread_log.json and return None — never raise.
     """
     try:
-        r = requests.get(
+        r = _alpaca_get(
             f'{DATA_URL}/v2/options/contracts',
             headers=_data_headers(),
             params={
@@ -496,7 +521,12 @@ def _fetch_options_chain(expiry, now_str):
             },
             timeout=15,
         )
-        r.raise_for_status()
+        if r is None:
+            reason = 'contracts fetch returned None after retries'
+            print(f'  [chain] {reason}')
+            _log({'timestamp': now_str, 'event': 'CHAIN_FETCH_ERROR',
+                  'expiry': str(expiry), 'reason': reason})
+            return None
         contracts = r.json().get('option_contracts', [])
         if not contracts:
             reason = f'no contracts returned by Alpaca for expiry {expiry}'
@@ -512,13 +542,17 @@ def _fetch_options_chain(expiry, now_str):
         for batch_start in range(0, len(symbols), 100):
             batch = symbols[batch_start:batch_start + 100]
             try:
-                rs = requests.get(
+                rs = _alpaca_get(
                     f'{DATA_URL}/v2/options/snapshots',
                     headers=_data_headers(),
                     params={'symbols': ','.join(batch), 'feed': 'indicative'},
                     timeout=15,
                 )
-                rs.raise_for_status()
+                if rs is None:
+                    reason = f'snapshots batch failed after retries (offset {batch_start})'
+                    print(f'  [chain] {reason}')
+                    _log({'timestamp': now_str, 'event': 'CHAIN_BATCH_ERROR', 'reason': reason})
+                    continue
                 for sym, snap in rs.json().get('snapshots', {}).items():
                     q   = snap.get('latestQuote', {})
                     bid = float(q.get('bp') or 0)
@@ -661,13 +695,13 @@ def _current_cost_to_close(short_sym, long_sym):
     Positive = we pay to close (normal for a short spread). Returns None on error.
     """
     try:
-        rs = requests.get(
+        rs = _alpaca_get(
             f'{DATA_URL}/v2/options/snapshots',
             headers=_data_headers(),
             params={'symbols': f'{short_sym},{long_sym}', 'feed': 'indicative'},
-            timeout=10,
         )
-        rs.raise_for_status()
+        if rs is None:
+            return None
         snaps = rs.json().get('snapshots', {})
 
         def _mid(sym):
@@ -748,9 +782,9 @@ def _place_close_order(short_sym, long_sym, order_type='market', limit_price=Non
 
 def _get_order(order_id):
     try:
-        r = requests.get(f'{PAPER_BASE_URL}/v2/orders/{order_id}',
-                         headers=_headers(), timeout=10)
-        r.raise_for_status()
+        r = _alpaca_get(f'{PAPER_BASE_URL}/v2/orders/{order_id}', headers=_headers())
+        if r is None:
+            return None
         return r.json()
     except Exception as e:
         print(f'  [get_order] {e}')
@@ -1086,7 +1120,7 @@ def _check_daily_summary(pos_state, weekly, now_str):
     """Send once-daily summary at 3:35pm ET. ACTIVE-gated."""
     if not ACTIVE:
         return
-    today_str = date.today().isoformat()
+    today_str = datetime.now(ET).date().isoformat()
     if pos_state.get('daily_summary_sent') == today_str:
         return
     if not _is_summary_time():
@@ -1309,7 +1343,12 @@ def main():
     run_scan()
 
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            print(f'[scheduler] ERROR — {type(e).__name__}: {e}')
+            _log({'timestamp': datetime.now(ET).strftime('%Y-%m-%d %H:%M ET'),
+                  'event': 'SCHEDULER_ERROR', 'error': f'{type(e).__name__}: {e}'})
         time.sleep(30)
 
 
