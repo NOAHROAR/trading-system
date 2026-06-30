@@ -834,7 +834,10 @@ def _attempt_entry(pos_state, weekly, now_str, short_sym, long_sym,
         status = order.get('status', '')
 
         if status == 'filled':
-            fill_credit = float(order.get('filled_avg_price') or credit)
+            raw_price   = float(order.get('filled_avg_price') or credit)
+            fill_credit = abs(raw_price)   # Alpaca returns negative for net credit received
+            if raw_price < 0:
+                print(f'  [entry] filled_avg_price was negative ({raw_price}) — using abs()')
             max_risk    = round((SPREAD_WIDTH - fill_credit) * 100, 2)
             breakeven   = round(short_strike - fill_credit, 2)
             pos = {
