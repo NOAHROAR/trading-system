@@ -1133,31 +1133,75 @@ def _check_daily_summary(pos_state, weekly, now_str):
     pos_state['daily_summary_sent'] = today_str
     _save_positions(pos_state)
 
-    n_pos     = len(pos_state.get('positions', []))
-    week_loss = weekly.get('weekly_realized_loss', 0.0)
+    positions  = pos_state.get('positions', [])
+    real_pos   = [p for p in positions
+                  if not (p.get('reconciled') and p.get('short_symbol') == 'UNKNOWN')]
+    week_loss  = weekly.get('weekly_realized_loss', 0.0)
 
+    # Trade log: count entries (OPEN) and exits (CLOSE) separately.
+    # Note: trade log is on Railway ephemeral filesystem; counts are best-effort
+    # if a container restart wiped the file mid-day.
     try:
         with open(TRADE_LOG_FILE) as f:
             tlog = json.load(f)
+        today_opens  = [t for t in tlog
+                        if t.get('type') == 'OPEN'
+                        and str(t.get('timestamp', '')).startswith(today_str)]
         today_closes = [t for t in tlog
                         if t.get('type') == 'CLOSE'
                         and str(t.get('timestamp', '')).startswith(today_str)]
-        daily_pnl    = sum(t.get('pnl', 0) for t in today_closes)
-        trades_today = len(today_closes)
+        realized_pnl  = sum(t.get('pnl', 0) for t in today_closes)
+        entries_today = len(today_opens)
+        exits_today   = len(today_closes)
     except Exception:
-        daily_pnl = trades_today = 0
+        realized_pnl = entries_today = exits_today = 0
+
+    # Fetch live prices for tracked open positions to compute unrealized P&L.
+    unrealized_pnl = 0.0
+    pos_costs: dict = {}
+    for pos in real_pos:
+        ss = pos.get('short_symbol', '')
+        ls = pos.get('long_symbol', '')
+        if ss and ls:
+            cost = _current_cost_to_close(ss, ls)
+            pos_costs[(ss, ls)] = cost
+            if cost is not None:
+                unrealized_pnl += round((pos.get('credit', 0) - cost) * 100, 2)
+
+    # Cross-check Alpaca for open SPY option legs — survives a wiped positions file.
+    alpaca_note = ''
+    try:
+        r = _alpaca_get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers())
+        if r is not None:
+            spy_legs = [p for p in r.json()
+                        if p.get('asset_class') == 'us_option'
+                        and str(p.get('symbol', '')).startswith('SPY')]
+            alpaca_spreads = len(spy_legs) // 2
+            file_spreads   = len(real_pos)
+            if alpaca_spreads != file_spreads:
+                alpaca_note = (f' ⚠️ Alpaca shows {len(spy_legs)} leg(s) '
+                               f'({alpaca_spreads} spread(s)) — state file has {file_spreads}')
+            else:
+                alpaca_note = f' ✓ Alpaca confirms {len(spy_legs)} leg(s)'
+    except Exception:
+        pass
 
     pos_detail = ''
-    for pos in pos_state.get('positions', []):
+    for pos in real_pos:
+        ss, ls  = pos.get('short_symbol', ''), pos.get('long_symbol', '')
+        cost    = pos_costs.get((ss, ls))
+        unr_str = (f'  unreal ${round((pos.get("credit",0)-cost)*100,2):+.2f}'
+                   if cost is not None else '')
         pos_detail += (
             f'\n  {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P '
-            f'exp={pos["expiration"]}  credit=${pos["credit"]:.2f}'
+            f'exp={pos["expiration"]}  credit=${pos["credit"]:.2f}{unr_str}'
         )
 
     _discord(
         f'📊 **Credit Spread Daily Summary**\n'
-        f'Open positions: {n_pos}{pos_detail}\n'
-        f'Trades today: {trades_today}  |  Daily P&L: ${daily_pnl:+.2f}\n'
+        f'Open positions: {len(real_pos)}{alpaca_note}{pos_detail}\n'
+        f'Entries today: {entries_today}  |  Exits today: {exits_today}\n'
+        f'Realized P&L: ${realized_pnl:+.2f}  |  Unrealized: ${unrealized_pnl:+.2f}\n'
         f'Week-to-date loss: ${week_loss:.2f} / ${WEEKLY_LOSS_LIMIT:.0f} limit'
     )
 
