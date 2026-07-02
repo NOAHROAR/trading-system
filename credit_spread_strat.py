@@ -1633,7 +1633,7 @@ def main():
     _init_files()
     _reconcile_on_startup()
 
-    schedule.every(15).minutes.do(run_scan)
+    schedule.every(5).minutes.do(run_scan)
 
     if ACTIVE:
         _discord(
