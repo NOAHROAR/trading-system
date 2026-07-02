@@ -1345,6 +1345,17 @@ def _check_entry_conditions(pos_state, weekly):
     if not all(v['passed'] for v in conds.values()):
         return False, conds, spy_px, ivr, vix
 
+    # Underwater position gate — don't add a second spread if the first is at a loss
+    real_pos = [p for p in pos_state.get('positions', [])
+                if not (p.get('reconciled') and p.get('short_symbol') == 'UNKNOWN')]
+    if len(real_pos) == 1:
+        p    = real_pos[0]
+        cost = _current_cost_to_close(p['short_symbol'], p['long_symbol'])
+        if cost is not None and cost > p.get('credit', 0):
+            _c('underwater_block', False,
+               f'cost={cost:.4f} > credit={p.get("credit", 0):.4f}')
+            return False, conds, spy_px, ivr, vix
+
     # SPY SMA filter
     above_sma, spy_close, sma_val = _spy_above_sma20()
     spy_px = spy_close
@@ -1592,7 +1603,10 @@ def run_scan():
             scan_result = 'entry_filled' if filled else 'entry_not_filled'
     else:
         fails = [k for k, v in conditions.items() if not v.get('passed')]
-        print(f'  No entry — failed: {", ".join(fails) if fails else "(no conditions)"}')
+        if 'underwater_block' in fails:
+            print('  No entry — blocked: existing position underwater')
+        else:
+            print(f'  No entry — failed: {", ".join(fails) if fails else "(no conditions)"}')
 
     # ── 5. Log scan ────────────────────────────────────────────────────────────
     log_entry = {
