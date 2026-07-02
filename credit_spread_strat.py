@@ -61,6 +61,7 @@ DELTA_TOLERANCE   = 0.05     # reject if no strike within 0.05 of target delta
 SPREAD_WIDTH      = 5.0
 MIN_CREDIT        = 0.25
 MAX_POSITIONS     = 2
+TICKERS           = ['SPY', 'QQQ']   # underlyings traded; shared 2-position limit
 PROFIT_TARGET_PCT = 0.50
 STOP_LOSS_PCT     = 2.00
 ORDER_FILL_TIMEOUT = 300
@@ -564,13 +565,13 @@ def _reconcile_on_startup():
         r = _alpaca_get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers())
         if r is None:
             raise RuntimeError('positions fetch returned None after retries')
-        spy_option_legs = [
+        option_legs = [
             p for p in r.json()
             if p.get('asset_class') == 'us_option'
-            and str(p.get('symbol', '')).startswith('SPY')
+            and any(str(p.get('symbol', '')).startswith(t) for t in TICKERS)
         ]
         expected_legs = len(pos_state.get('positions', [])) * 2
-        actual_legs   = len(spy_option_legs)
+        actual_legs   = len(option_legs)
 
         if actual_legs == expected_legs:
             print(f'[reconcile] Alpaca options OK — '
@@ -581,14 +582,14 @@ def _reconcile_on_startup():
                         else f'{-orphaned} extra state entry(ies) — stale entries possible'
             msg = (
                 f'⚠️ OPTIONS MISMATCH on startup | '
-                f'Alpaca: {actual_legs} SPY option leg(s), '
+                f'Alpaca: {actual_legs} option leg(s), '
                 f'state file expects {expected_legs} ({len(pos_state["positions"])} spread(s)). '
                 f'{direction}. Manual review required.'
             )
             print(f'[reconcile] {msg}')
             _log({'timestamp': now_str, 'event': 'RECONCILE_OPTIONS_MISMATCH',
                   'alpaca_legs': actual_legs, 'expected_legs': expected_legs,
-                  'alpaca_symbols': [p['symbol'] for p in spy_option_legs]})
+                  'alpaca_symbols': [p['symbol'] for p in option_legs]})
             _discord(msg)
 
             # Add blocker placeholders for each untracked spread (2 legs = 1 spread)
@@ -685,10 +686,10 @@ def _spy_price():
         return None
 
 
-def _spy_above_sma20():
-    """Return (above_sma: bool|None, spy_close: float|None, sma: float|None)."""
+def _above_sma20(ticker):
+    """Return (above_sma: bool|None, close: float|None, sma: float|None)."""
     try:
-        df = yf.download('SPY', period='40d', interval='1d',
+        df = yf.download(ticker, period='40d', interval='1d',
                          progress=False, auto_adjust=True, timeout=10)
         if df.empty:
             return None, None, None
@@ -726,10 +727,10 @@ def _vix_ivrank():
 
 # ── OPTIONS CHAIN ──────────────────────────────────────────────────────────────
 
-def _find_target_expiration():
-    """Return SPY expiry closest to TARGET_DTE. Widens to 5–10 DTE if needed."""
+def _find_target_expiration(ticker):
+    """Return expiry closest to TARGET_DTE for ticker. Widens to 5–10 DTE if needed."""
     try:
-        expirations = yf.Ticker('SPY').options
+        expirations = yf.Ticker(ticker).options
         if not expirations:
             return None
         today     = date.today()
@@ -757,9 +758,9 @@ def _find_target_expiration():
         return None
 
 
-def _fetch_options_chain(expiry, now_str):
+def _fetch_options_chain(ticker, expiry, now_str):
     """
-    Fetch SPY put chain for expiry.
+    Fetch put chain for ticker/expiry.
     Contracts: paper-api.alpaca.markets/v2/options/contracts (trading API)
     Snapshots: data.alpaca.markets/v1beta1/options/snapshots (market data API)
     Returns dict {symbol: {strike, bid, ask, mid, delta, iv}} or None on any failure.
@@ -769,7 +770,7 @@ def _fetch_options_chain(expiry, now_str):
             f'{PAPER_BASE_URL}/v2/options/contracts',
             headers=_headers(),
             params={
-                'underlying_symbols': 'SPY',
+                'underlying_symbols': ticker,
                 'type':               'put',
                 'expiration_date':    expiry.isoformat(),
                 'limit':              200,
@@ -1060,8 +1061,8 @@ def _cancel_order(order_id):
 
 # ── ENTRY EXECUTION ────────────────────────────────────────────────────────────
 
-def _attempt_entry(pos_state, weekly, now_str, short_sym, long_sym,
-                   short_strike, long_strike, expiry, credit, spy_px, short_delta):
+def _attempt_entry(pos_state, weekly, now_str, ticker, short_sym, long_sym,
+                   short_strike, long_strike, expiry, credit, stock_px, short_delta):
     """
     Place opening order, poll for fill up to ORDER_FILL_TIMEOUT seconds.
     Updates pos_state['positions'] in place on fill.
@@ -1095,6 +1096,7 @@ def _attempt_entry(pos_state, weekly, now_str, short_sym, long_sym,
             max_risk    = round((SPREAD_WIDTH - fill_credit) * 100, 2)
             breakeven   = round(short_strike - fill_credit, 2)
             pos = {
+                'ticker':         ticker,
                 'short_symbol':   short_sym,
                 'long_symbol':    long_sym,
                 'short_strike':   short_strike,
@@ -1108,7 +1110,7 @@ def _attempt_entry(pos_state, weekly, now_str, short_sym, long_sym,
                 'open_time':      now_str,
                 'entry_order_id': order_id,
                 'short_delta':    round(short_delta, 4) if short_delta else None,
-                'spy_entry_px':   spy_px,
+                'spy_entry_px':   stock_px,
             }
             pos_state['positions'].append(pos)
             _save_positions(pos_state)
@@ -1116,7 +1118,7 @@ def _attempt_entry(pos_state, weekly, now_str, short_sym, long_sym,
             _log_trade({'timestamp': now_str, 'type': 'OPEN', **pos})
             _discord(
                 f'🟢 CREDIT SPREAD OPEN | '
-                f'SPY {short_strike:.0f}/{long_strike:.0f}P  exp {expiry} | '
+                f'{ticker} {short_strike:.0f}/{long_strike:.0f}P  exp {expiry} | '
                 f'Credit: ${fill_credit:.2f} | Max risk: ${max_risk:.2f} | '
                 f'Breakeven: ${breakeven:.2f} | '
                 f'Positions open: {len(pos_state["positions"])}'
@@ -1159,7 +1161,8 @@ def _record_exit(pos_state, weekly, pos, reason, close_cost, now_str):
     """
     credit  = pos['credit']
     pnl     = round((credit - close_cost) * 100, 2)   # 100 multiplier per contract
-    label   = f'SPY {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P {pos["expiration"]}'
+    tkr     = pos.get('ticker', pos.get('short_symbol', 'SPY')[:3])
+    label   = f'{tkr} {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P {pos["expiration"]}'
 
     old_loss = weekly.get('weekly_realized_loss', 0.0)
     new_loss = round(max(0.0, old_loss - pnl), 2)
@@ -1241,7 +1244,8 @@ def _monitor_positions(pos_state, weekly, now_str):
         long_sym  = pos['long_symbol']
         expiry    = date.fromisoformat(pos['expiration'])
         credit    = pos['credit']
-        label     = f'SPY {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P {expiry}'
+        tkr       = pos.get('ticker', pos.get('short_symbol', 'SPY')[:3])
+        label     = f'{tkr} {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P {expiry}'
 
         try:
             # ── Expiration force-close (9:45am ET on expiry day) ─────────────
@@ -1321,13 +1325,13 @@ def _monitor_positions(pos_state, weekly, now_str):
 
 # ── ENTRY CONDITIONS ───────────────────────────────────────────────────────────
 
-def _check_entry_conditions(pos_state, weekly):
+def _check_entry_conditions(ticker, pos_state, weekly):
     """
     Evaluate all gates cheapest-first. Short-circuits on first group failure.
-    Returns (all_passed: bool, conditions: dict, spy_px, ivr, vix).
+    Returns (all_passed: bool, conditions: dict, stock_px, ivr, vix).
     """
-    conds  = {}
-    spy_px = ivr = vix = None
+    conds    = {}
+    stock_px = ivr = vix = None
 
     def _c(name, passed, detail):
         conds[name] = {'passed': bool(passed), 'detail': str(detail)}
@@ -1343,7 +1347,7 @@ def _check_entry_conditions(pos_state, weekly):
        f'loss=${weekly.get("weekly_realized_loss", 0):.2f} / ${WEEKLY_LOSS_LIMIT:.0f}')
 
     if not all(v['passed'] for v in conds.values()):
-        return False, conds, spy_px, ivr, vix
+        return False, conds, stock_px, ivr, vix
 
     # Underwater position gate — don't add a second spread if the first is at a loss
     real_pos = [p for p in pos_state.get('positions', [])
@@ -1354,20 +1358,21 @@ def _check_entry_conditions(pos_state, weekly):
         if cost is not None and cost > p.get('credit', 0):
             _c('underwater_block', False,
                f'cost={cost:.4f} > credit={p.get("credit", 0):.4f}')
-            return False, conds, spy_px, ivr, vix
+            return False, conds, stock_px, ivr, vix
 
-    # SPY SMA filter
-    above_sma, spy_close, sma_val = _spy_above_sma20()
-    spy_px = spy_close
+    # SMA filter
+    above_sma, stock_close, sma_val = _above_sma20(ticker)
+    stock_px = stock_close
+    sma_key  = f'{ticker.lower()}_above_sma'
     if above_sma is None:
-        _c('spy_above_sma', False, 'data unavailable')
+        _c(sma_key, False, 'data unavailable')
     else:
-        _c('spy_above_sma', above_sma,
-           f'SPY={spy_close:.2f}  SMA20={sma_val:.2f}  '
+        _c(sma_key, above_sma,
+           f'{ticker}={stock_close:.2f}  SMA20={sma_val:.2f}  '
            f'{"above" if above_sma else "BELOW"}')
 
     if not all(v['passed'] for v in conds.values()):
-        return False, conds, spy_px, ivr, vix
+        return False, conds, stock_px, ivr, vix
 
     # IV rank + VIX cap
     ivr, vix = _vix_ivrank()
@@ -1380,7 +1385,75 @@ def _check_entry_conditions(pos_state, weekly):
         _c('vix_cap',  vix < MAX_VIX,
            f'VIX={vix:.2f} {"<" if vix < MAX_VIX else "≥"} {MAX_VIX}')
 
-    return all(v['passed'] for v in conds.values()), conds, spy_px, ivr, vix
+    return all(v['passed'] for v in conds.values()), conds, stock_px, ivr, vix
+
+
+# ── TICKER EVALUATION ──────────────────────────────────────────────────────────
+
+def _evaluate_ticker(ticker, pos_state, weekly, now_str):
+    """
+    Full entry evaluation for one ticker.
+    Returns (signal_dict | None, conditions_dict).
+    signal_dict has keys: ticker, expiry, short_sym, long_sym, short_strike,
+                          long_strike, short_delta, credit, stock_px, ivr, vix.
+    """
+    passed, conds, stock_px, ivr, vix = _check_entry_conditions(ticker, pos_state, weekly)
+    if not passed:
+        return None, conds
+
+    expiry = _find_target_expiration(ticker)
+    if expiry is None:
+        conds['expiry_found'] = {'passed': False, 'detail': 'no valid expiration found'}
+        return None, conds
+    dte = (expiry - date.today()).days
+    conds['expiry_found'] = {'passed': True, 'detail': f'{expiry} ({dte} DTE)'}
+
+    chain = _fetch_options_chain(ticker, expiry, now_str)
+    if chain is None:
+        conds['chain_fetched'] = {'passed': False,
+                                   'detail': 'chain unavailable (see CHAIN_* log event)'}
+        return None, conds
+    conds['chain_fetched'] = {'passed': True, 'detail': f'{len(chain)} contracts'}
+
+    short_sym, short_strike, short_delta = _find_short_strike(
+        chain, stock_px, expiry, vix, now_str
+    )
+    if short_sym is None:
+        conds['short_strike'] = {'passed': False,
+                                  'detail': 'no suitable 20Δ put (see CHAIN_* log)'}
+        return None, conds
+    conds['short_strike'] = {'passed': True,
+                              'detail': f'${short_strike:.0f}  delta={short_delta:.3f}'}
+
+    long_sym, long_strike = _find_long_symbol(chain, short_strike)
+    if long_sym is None:
+        conds['long_strike'] = {'passed': False, 'detail': 'not found in chain'}
+        return None, conds
+    conds['long_strike'] = {'passed': True, 'detail': f'${long_strike:.0f}'}
+
+    credit = _spread_mid(chain, short_sym, long_sym)
+    if credit is None or credit < MIN_CREDIT:
+        conds['min_credit'] = {
+            'passed': False,
+            'detail': (f'credit=${credit:.4f} < ${MIN_CREDIT}'
+                       if credit is not None else 'mid unavailable'),
+        }
+        return None, conds
+    conds['min_credit'] = {'passed': True, 'detail': f'credit=${credit:.4f}'}
+
+    return {
+        'ticker':       ticker,
+        'expiry':       expiry,
+        'short_sym':    short_sym,
+        'long_sym':     long_sym,
+        'short_strike': short_strike,
+        'long_strike':  long_strike,
+        'short_delta':  short_delta,
+        'credit':       credit,
+        'stock_px':     stock_px,
+        'ivr':          ivr,
+        'vix':          vix,
+    }, conds
 
 
 # ── DAILY SUMMARY ──────────────────────────────────────────────────────────────
@@ -1438,16 +1511,16 @@ def _check_daily_summary(pos_state, weekly, now_str):
     try:
         r = _alpaca_get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers())
         if r is not None:
-            spy_legs = [p for p in r.json()
-                        if p.get('asset_class') == 'us_option'
-                        and str(p.get('symbol', '')).startswith('SPY')]
-            alpaca_spreads = len(spy_legs) // 2
+            tracked_legs = [p for p in r.json()
+                            if p.get('asset_class') == 'us_option'
+                            and any(str(p.get('symbol', '')).startswith(t) for t in TICKERS)]
+            alpaca_spreads = len(tracked_legs) // 2
             file_spreads   = len(real_pos)
             if alpaca_spreads != file_spreads:
-                alpaca_note = (f' ⚠️ Alpaca shows {len(spy_legs)} leg(s) '
+                alpaca_note = (f' ⚠️ Alpaca shows {len(tracked_legs)} leg(s) '
                                f'({alpaca_spreads} spread(s)) — state file has {file_spreads}')
             else:
-                alpaca_note = f' ✓ Alpaca confirms {len(spy_legs)} leg(s)'
+                alpaca_note = f' ✓ Alpaca confirms {len(tracked_legs)} leg(s)'
     except Exception:
         pass
 
@@ -1457,8 +1530,9 @@ def _check_daily_summary(pos_state, weekly, now_str):
         cost    = pos_costs.get((ss, ls))
         unr_str = (f'  unreal ${round((pos.get("credit",0)-cost)*100,2):+.2f}'
                    if cost is not None else '')
+        tkr     = pos.get('ticker', pos.get('short_symbol', 'SPY')[:3])
         pos_detail += (
-            f'\n  {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P '
+            f'\n  [{tkr}] {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P '
             f'exp={pos["expiration"]}  credit=${pos["credit"]:.2f}{unr_str}'
         )
 
@@ -1500,113 +1574,55 @@ def run_scan():
     except Exception as e:
         print(f'  [summary] ERROR — {type(e).__name__}: {e}')
 
-    # ── 3. Entry conditions ────────────────────────────────────────────────────
-    should_enter = False
-    conditions   = {}
-    spy_px = ivr = vix = chain = None
-    expiry = short_sym = long_sym = None
-    short_strike = long_strike = short_delta = credit = None
-    scan_result  = 'no_signal'
+    # ── 3. Evaluate each ticker for entry ─────────────────────────────────────
+    ticker_signals = {}   # ticker → signal dict
+    ticker_conds   = {}   # ticker → conditions dict (for logging)
+    scan_result    = 'no_signal'
+    chosen         = None
 
-    try:
-        should_enter, conditions, spy_px, ivr, vix = _check_entry_conditions(
-            pos_state, weekly
-        )
+    for ticker in TICKERS:
+        try:
+            signal, conds = _evaluate_ticker(ticker, pos_state, weekly, now_str)
+            ticker_conds[ticker] = conds
+            if signal:
+                ticker_signals[ticker] = signal
+        except Exception as e:
+            print(f'  [{ticker}] conditions ERROR — {type(e).__name__}: {e}')
+            _log({'timestamp': now_str, 'event': 'CONDITIONS_ERROR',
+                  'ticker': ticker, 'error': f'{type(e).__name__}: {e}'})
 
-        if should_enter:
-            expiry = _find_target_expiration()
-            if expiry is None:
-                should_enter = False
-                conditions['expiry_found'] = {
-                    'passed': False, 'detail': 'no valid expiration found'
-                }
-            else:
-                dte = (expiry - date.today()).days
-                conditions['expiry_found'] = {
-                    'passed': True, 'detail': f'{expiry} ({dte} DTE)'
-                }
+    # ── 4. Pick winner (higher credit) and execute ─────────────────────────────
+    if ticker_signals:
+        chosen = max(ticker_signals.values(), key=lambda s: s['credit'])
 
-        if should_enter:
-            chain = _fetch_options_chain(expiry, now_str)
-            if chain is None:
-                should_enter = False
-                conditions['chain_fetched'] = {
-                    'passed': False, 'detail': 'chain unavailable (see CHAIN_* log event)'
-                }
-            else:
-                conditions['chain_fetched'] = {
-                    'passed': True, 'detail': f'{len(chain)} contracts'
-                }
-
-                short_sym, short_strike, short_delta = _find_short_strike(
-                    chain, spy_px, expiry, vix, now_str
-                )
-                if short_sym is None:
-                    should_enter = False
-                    conditions['short_strike'] = {
-                        'passed': False, 'detail': 'no suitable 20Δ put (see CHAIN_* log)'
-                    }
-                else:
-                    conditions['short_strike'] = {
-                        'passed': True,
-                        'detail': f'${short_strike:.0f}  delta={short_delta:.3f}'
-                    }
-
-        if should_enter:
-            long_sym, long_strike = _find_long_symbol(chain, short_strike)
-            if long_sym is None:
-                should_enter = False
-                conditions['long_strike'] = {'passed': False, 'detail': 'not found in chain'}
-            else:
-                conditions['long_strike'] = {
-                    'passed': True, 'detail': f'${long_strike:.0f}'
-                }
-
-        if should_enter:
-            credit = _spread_mid(chain, short_sym, long_sym)
-            if credit is None or credit < MIN_CREDIT:
-                should_enter = False
-                conditions['min_credit'] = {
-                    'passed': False,
-                    'detail': (f'credit=${credit:.4f} < ${MIN_CREDIT}'
-                               if credit is not None else 'mid unavailable'),
-                }
-            else:
-                conditions['min_credit'] = {
-                    'passed': True, 'detail': f'credit=${credit:.4f}'
-                }
-
-    except Exception as e:
-        print(f'  [conditions] ERROR — {type(e).__name__}: {e}')
-        _log({'timestamp': now_str, 'event': 'CONDITIONS_ERROR',
-              'error': f'{type(e).__name__}: {e}'})
-        should_enter = False
-
-    # ── 4. Execute or log DORMANT ──────────────────────────────────────────────
-    if should_enter:
+    if chosen:
+        t = chosen['ticker']
         if not ACTIVE:
             scan_result = 'dormant_would_enter'
             print(
                 f'  DORMANT MODE — entry skipped | '
-                f'SPY {short_strike:.0f}/{long_strike:.0f}P  '
-                f'exp={expiry}  credit=${credit:.4f}  '
-                f'delta={short_delta:.3f}'
+                f'{t} {chosen["short_strike"]:.0f}/{chosen["long_strike"]:.0f}P  '
+                f'exp={chosen["expiry"]}  credit=${chosen["credit"]:.4f}  '
+                f'delta={chosen["short_delta"]:.3f}'
             )
         else:
-            print(f'  ENTERING: SPY {short_strike:.0f}/{long_strike:.0f}P  '
-                  f'exp={expiry}  credit=${credit:.4f}')
+            print(f'  ENTERING: {t} {chosen["short_strike"]:.0f}/{chosen["long_strike"]:.0f}P  '
+                  f'exp={chosen["expiry"]}  credit=${chosen["credit"]:.4f}')
             filled = _attempt_entry(
                 pos_state, weekly, now_str,
-                short_sym, long_sym, short_strike, long_strike,
-                expiry, credit, spy_px, short_delta,
+                t, chosen['short_sym'], chosen['long_sym'],
+                chosen['short_strike'], chosen['long_strike'],
+                chosen['expiry'], chosen['credit'],
+                chosen['stock_px'], chosen['short_delta'],
             )
             scan_result = 'entry_filled' if filled else 'entry_not_filled'
     else:
-        fails = [k for k, v in conditions.items() if not v.get('passed')]
-        if 'underwater_block' in fails:
-            print('  No entry — blocked: existing position underwater')
-        else:
-            print(f'  No entry — failed: {", ".join(fails) if fails else "(no conditions)"}')
+        for t, conds in ticker_conds.items():
+            fails = [k for k, v in conds.items() if not v.get('passed')]
+            if 'underwater_block' in fails:
+                print(f'  [{t}] No entry — blocked: existing position underwater')
+            elif fails:
+                print(f'  [{t}] No entry — failed: {", ".join(fails)}')
 
     # ── 5. Log scan ────────────────────────────────────────────────────────────
     log_entry = {
@@ -1617,16 +1633,17 @@ def run_scan():
         'open_positions': len(pos_state.get('positions', [])),
         'weekly_loss':    weekly.get('weekly_realized_loss', 0.0),
         'cooldown':       weekly.get('cooldown_active', False),
-        'conditions':     conditions,
+        'conditions':     ticker_conds,
     }
-    if scan_result in ('dormant_would_enter', 'entry_filled', 'entry_not_filled'):
+    if scan_result in ('dormant_would_enter', 'entry_filled', 'entry_not_filled') and chosen:
         log_entry['signal'] = {
-            'short_symbol': short_sym,
-            'long_symbol':  long_sym,
-            'expiry':       str(expiry),
-            'credit':       credit,
-            'short_delta':  round(short_delta, 4) if short_delta else None,
-            'spy_px':       spy_px,
+            'ticker':       chosen['ticker'],
+            'short_symbol': chosen['short_sym'],
+            'long_symbol':  chosen['long_sym'],
+            'expiry':       str(chosen['expiry']),
+            'credit':       chosen['credit'],
+            'short_delta':  round(chosen['short_delta'], 4) if chosen['short_delta'] else None,
+            'stock_px':     chosen['stock_px'],
         }
     _log(log_entry)
 
@@ -1635,12 +1652,12 @@ def run_scan():
 
 def main():
     print('=' * 62)
-    print('  SPY PUT CREDIT SPREAD  |  7 DTE  |  20Δ / $5-wide')
+    print('  SPY & QQQ PUT CREDIT SPREADS  |  7 DTE  |  20Δ / $5-wide')
     print(f'  ACTIVE = {ACTIVE}')
     if not ACTIVE:
         print('  *** DORMANT — scanning and logging, NO orders placed ***')
     print('  Alpaca v2 REST API  |  raw requests  |  no SDK')
-    print('  Scan every 15 min, 9:30–16:00 ET, Mon–Fri')
+    print('  Scan every 5 min, 9:30–16:00 ET, Mon–Fri')
     print('=' * 62)
 
     _init_db()
@@ -1651,8 +1668,9 @@ def main():
 
     if ACTIVE:
         _discord(
-            f'✅ Credit Spread system live | SPY 7DTE put spreads | '
-            f'20Δ short / $5-wide / ${MIN_CREDIT:.2f} min credit'
+            f'✅ Credit Spread system live | SPY & QQQ 7DTE put spreads | '
+            f'20Δ short / $5-wide / ${MIN_CREDIT:.2f} min credit | '
+            f'2 positions max combined'
         )
     else:
         print('  Dormant mode: conditions evaluated and logged each scan.')
