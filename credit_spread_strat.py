@@ -72,6 +72,40 @@ MIN_IVR           = 30.0
 MAX_VIX           = 35.0
 SMA_PERIOD        = 20
 
+# ── MACRO EVENT CALENDAR ───────────────────────────────────────────────────────
+# Update these each January using official sources:
+#   FOMC: federalreserve.gov/monetarypolicy/fomccalendars.htm
+#   CPI:  bls.gov/schedule/news_release/cpi.htm
+#   GDP:  bea.gov/news/schedule
+# Jobs Report (NFP) is always the first Friday of each month — computed in code.
+
+FOMC_DAYS = {
+    # 2026 — both Day 1 and Day 2 of each meeting
+    '2026-01-28', '2026-01-29',
+    '2026-03-18', '2026-03-19',
+    '2026-04-29', '2026-04-30',
+    '2026-06-10', '2026-06-11',
+    '2026-07-29', '2026-07-30',
+    '2026-09-16', '2026-09-17',
+    '2026-11-04', '2026-11-05',
+    '2026-12-09', '2026-12-10',
+}
+
+CPI_DAYS = {
+    # 2026 — BLS CPI release dates (prior month's data, ~12 days after month end)
+    '2026-01-14', '2026-02-11', '2026-03-11', '2026-04-10',
+    '2026-05-13', '2026-06-11', '2026-07-14', '2026-08-12',
+    '2026-09-09', '2026-10-14', '2026-11-12', '2026-12-10',
+}
+
+GDP_DAYS = {
+    # 2026 — BEA advance GDP estimates (~30 days after each quarter end)
+    '2026-01-29',   # Q4 2025
+    '2026-04-29',   # Q1 2026
+    '2026-07-30',   # Q2 2026
+    '2026-10-29',   # Q3 2026
+}
+
 # Timing
 ENTRY_HOUR_START, ENTRY_MIN_START =  9, 45
 ENTRY_HOUR_END,   ENTRY_MIN_END   = 15, 30
@@ -1323,6 +1357,32 @@ def _monitor_positions(pos_state, weekly, now_str):
         _save_weekly(weekly)
 
 
+# ── MACRO EVENT FILTER ─────────────────────────────────────────────────────────
+
+def _macro_event_today():
+    """
+    Return an event name string if today (ET) is a blocked macro event day, else None.
+    Checked before all other entry conditions — no API calls required.
+    """
+    today = datetime.now(ET).date()
+    today_str = today.isoformat()
+
+    if today_str in FOMC_DAYS:
+        return 'FOMC meeting day'
+    if today_str in CPI_DAYS:
+        return 'CPI release day'
+    if today_str in GDP_DAYS:
+        return 'GDP release day'
+
+    # Jobs Report (NFP) — always the first Friday of each month
+    first          = today.replace(day=1)
+    days_to_friday = (4 - first.weekday()) % 7   # Friday = weekday 4
+    if today == first + timedelta(days=days_to_friday):
+        return 'Jobs Report day (NFP)'
+
+    return None
+
+
 # ── ENTRY CONDITIONS ───────────────────────────────────────────────────────────
 
 def _check_entry_conditions(ticker, pos_state, weekly):
@@ -1336,7 +1396,13 @@ def _check_entry_conditions(ticker, pos_state, weekly):
     def _c(name, passed, detail):
         conds[name] = {'passed': bool(passed), 'detail': str(detail)}
 
-    # Cheap gates first (no API calls)
+    # Macro event gate — day-wide block, no API call
+    macro = _macro_event_today()
+    _c('macro_event', macro is None, macro or 'none')
+    if macro:
+        return False, conds, stock_px, ivr, vix
+
+    # Cheap gates (no API calls)
     _c('active',          ACTIVE,
        'True' if ACTIVE else 'False — DORMANT')
     _c('entry_window',    _in_entry_window(),
@@ -1617,12 +1683,22 @@ def run_scan():
             )
             scan_result = 'entry_filled' if filled else 'entry_not_filled'
     else:
-        for t, conds in ticker_conds.items():
-            fails = [k for k, v in conds.items() if not v.get('passed')]
-            if 'underwater_block' in fails:
-                print(f'  [{t}] No entry — blocked: existing position underwater')
-            elif fails:
-                print(f'  [{t}] No entry — failed: {", ".join(fails)}')
+        # Macro event is day-wide — print once, not per ticker
+        macro_detail = next(
+            (c['macro_event']['detail']
+             for c in ticker_conds.values()
+             if not c.get('macro_event', {}).get('passed', True)),
+            None,
+        )
+        if macro_detail:
+            print(f'  No entry — macro event day: {macro_detail}')
+        else:
+            for t, conds in ticker_conds.items():
+                fails = [k for k, v in conds.items() if not v.get('passed')]
+                if 'underwater_block' in fails:
+                    print(f'  [{t}] No entry — blocked: existing position underwater')
+                elif fails:
+                    print(f'  [{t}] No entry — failed: {", ".join(fails)}')
 
     # ── 5. Log scan ────────────────────────────────────────────────────────────
     log_entry = {
