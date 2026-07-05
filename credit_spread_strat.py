@@ -287,6 +287,8 @@ def _db_load_positions():
         return {'positions': positions, 'daily_summary_sent': row[0] if row else None}
     except Exception as e:
         print(f'[db] _db_load_positions failed: {e}')
+        global _DB
+        _DB = None   # force reconnect on next call
         return None
 
 
@@ -330,6 +332,8 @@ def _db_save_positions(ps):
             conn.rollback()
         except Exception:
             pass
+        global _DB
+        _DB = None   # force reconnect on next call
         return False
 
 
@@ -354,6 +358,8 @@ def _db_load_weekly():
         }
     except Exception as e:
         print(f'[db] _db_load_weekly failed: {e}')
+        global _DB
+        _DB = None
         return None
 
 
@@ -385,6 +391,8 @@ def _db_save_weekly(w):
             conn.rollback()
         except Exception:
             pass
+        global _DB
+        _DB = None
         return False
 
 
@@ -690,34 +698,6 @@ def _flatten_columns(df):
         except Exception:
             pass
     return df
-
-
-def _spy_price():
-    """Current SPY mid-price from Alpaca IEX feed."""
-    try:
-        r = _alpaca_get(
-            f'{DATA_URL}/v2/stocks/SPY/quotes/latest',
-            headers=_data_headers(),
-            params={'feed': 'iex'},
-        )
-        if r is None:
-            return None
-        q   = r.json().get('quote', {})
-        bid = float(q.get('bp') or 0)
-        ask = float(q.get('ap') or 0)
-        if bid > 0 and ask > 0:
-            return round((bid + ask) / 2, 4)
-        r2 = _alpaca_get(
-            f'{DATA_URL}/v2/stocks/SPY/trades/latest',
-            headers=_data_headers(),
-            params={'feed': 'iex'},
-        )
-        if r2 is None:
-            return None
-        return float(r2.json()['trade']['p'])
-    except Exception as e:
-        print(f'  [spy_price] {e}')
-        return None
 
 
 def _above_sma20(ticker):
