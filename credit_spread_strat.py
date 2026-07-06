@@ -61,7 +61,7 @@ DELTA_TOLERANCE   = 0.05     # reject if no strike within 0.05 of target delta
 SPREAD_WIDTH      = 5.0
 MIN_CREDIT        = 0.25
 MAX_POSITIONS     = 2
-TICKERS           = ['SPY', 'QQQ']   # underlyings traded; shared 2-position limit
+TICKERS           = ['SPY']           # underlyings traded; shared 2-position limit
 PROFIT_TARGET_PCT = 0.50
 STOP_LOSS_PCT     = 2.00
 ORDER_FILL_TIMEOUT = 300
@@ -1646,9 +1646,8 @@ def _send_morning_vitals():
     now_et   = datetime.now(ET)
     date_str = now_et.strftime('%A %B %-d, %Y')
 
-    # SPY / QQQ price + SMA20
+    # SPY price + SMA20
     spy_above, spy_px, spy_sma = _above_sma20('SPY')
-    qqq_above, qqq_px, qqq_sma = _above_sma20('QQQ')
 
     def _sma_line(ticker, px, sma, above):
         if px is None or sma is None:
@@ -1657,7 +1656,6 @@ def _send_morning_vitals():
         return f'{ticker}:  ${px:.2f}  |  SMA20: ${sma:.2f}  |  {status}'
 
     spy_line = _sma_line('SPY', spy_px, spy_sma, spy_above)
-    qqq_line = _sma_line('QQQ', qqq_px, qqq_sma, qqq_above)
 
     # VIX + IVR
     ivr, vix = _vix_ivrank()
@@ -1708,7 +1706,6 @@ def _send_morning_vitals():
     msg = (
         f'📊 **MORNING VITALS — {date_str}**\n\n'
         f'{spy_line}\n'
-        f'{qqq_line}\n'
         f'{vix_line}\n'
         f'{ivr_line}\n'
         f'{macro_line}\n\n'
@@ -1852,7 +1849,7 @@ def run_scan():
 
 def main():
     print('=' * 62)
-    print('  SPY & QQQ PUT CREDIT SPREADS  |  7 DTE  |  20Δ / $5-wide')
+    print('  SPY PUT CREDIT SPREADS  |  7 DTE  |  20Δ / $5-wide')
     print(f'  ACTIVE = {ACTIVE}')
     if not ACTIVE:
         print('  *** DORMANT — scanning and logging, NO orders placed ***')
@@ -1868,9 +1865,9 @@ def main():
 
     if ACTIVE:
         _discord(
-            f'✅ Credit Spread system live | SPY & QQQ 7DTE put spreads | '
+            f'✅ Credit Spread system live | SPY 7DTE put spreads | '
             f'20Δ short / $5-wide / ${MIN_CREDIT:.2f} min credit | '
-            f'2 positions max combined'
+            f'2 positions max'
         )
     else:
         print('  Dormant mode: conditions evaluated and logged each scan.')
