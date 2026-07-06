@@ -24,6 +24,7 @@ import os
 import time
 from datetime import date, datetime, timedelta
 
+import numpy as np
 import pandas as pd
 import pytz
 import requests
@@ -735,7 +736,7 @@ def _above_sma20(ticker):
 
 
 def _vix_ivrank():
-    """Return (ivr_pct: float|None, vix: float|None). IVR = 252-day percentile."""
+    """VIX percentile fallback. Return (ivr_pct: float|None, vix: float|None)."""
     try:
         df = yf.download('^VIX', period=f'{VIX_IVR_WINDOW + 60}d',
                          interval='1d', progress=False, auto_adjust=False, timeout=10)
@@ -752,6 +753,120 @@ def _vix_ivrank():
     except Exception as e:
         print(f'  [vix_ivrank] {e}')
         return None, None
+
+
+def _spy_ivrank():
+    """
+    Return (ivr_pct: float|None, current_iv_pct: float|None).
+    IVR = percentile of current SPY ATM IV within 252-day Parkinson vol range.
+    current_iv_pct is annualised % (e.g. 12.5, not 0.125) — comparable to MAX_VIX=35.
+    Falls back to _vix_ivrank() if the SPY options fetch fails.
+    """
+    # ── Step 1: current ATM SPY IV from Alpaca ────────────────────────────────
+    current_iv = None
+    try:
+        spy_df = yf.download('SPY', period='2d', interval='1m',
+                              progress=False, auto_adjust=True, timeout=10)
+        if spy_df.empty:
+            raise ValueError('SPY price unavailable')
+        spy_df = _flatten_columns(spy_df)
+        S = float(spy_df['Close'].dropna().iloc[-1])
+
+        today = date.today()
+        exps  = yf.Ticker('SPY').options
+        if not exps:
+            raise ValueError('SPY options list unavailable')
+
+        best_exp, best_diff = None, float('inf')
+        for e in exps:
+            dte = (date.fromisoformat(e) - today).days
+            if 5 <= dte <= 14:
+                diff = abs(dte - 7)
+                if diff < best_diff:
+                    best_exp, best_diff = e, diff
+        if best_exp is None:
+            raise ValueError('No 5-14 DTE expiry available')
+
+        for lo_pct, hi_pct in [(0.99, 1.01), (0.98, 1.02)]:
+            r = _alpaca_get(
+                f'{PAPER_BASE_URL}/v2/options/contracts',
+                headers=_headers(),
+                params={
+                    'underlying_symbol': 'SPY',
+                    'expiration_date':   best_exp,
+                    'type':              'put',
+                    'strike_price_gte':  str(int(S * lo_pct)),
+                    'strike_price_lte':  str(int(S * hi_pct)),
+                    'limit': 10,
+                    'status': 'active',
+                }
+            )
+            contracts = r.json().get('option_contracts', []) if r else []
+            if contracts:
+                break
+        if not contracts:
+            raise ValueError('No ATM contracts found')
+
+        atm = min(contracts, key=lambda c: abs(float(c.get('strike_price', 0)) - S))
+        sym = atm['symbol']
+
+        rs = _alpaca_get(
+            f'{DATA_URL}/v1beta1/options/snapshots',
+            headers=_data_headers(),
+            params={'symbols': sym, 'feed': 'indicative'}
+        )
+        if rs is None:
+            raise ValueError('Snapshot endpoint unavailable')
+        snap = rs.json().get('snapshots', {}).get(sym)
+        if not snap:
+            raise ValueError(f'No snapshot for {sym}')
+
+        iv_raw = snap.get('impliedVolatility')
+        if iv_raw is not None:
+            current_iv = float(iv_raw)
+        else:
+            q   = snap.get('latestQuote', {})
+            bid = float(q.get('bp') or 0)
+            ask = float(q.get('ap') or 0)
+            if bid + ask > 0:
+                K  = float(atm.get('strike_price', S))
+                T  = (date.fromisoformat(best_exp) - today).days / 365.0
+                current_iv = _bs_iv_solve(S, K, T, (bid + ask) / 2)
+            if current_iv is None:
+                raise ValueError('IV not available in snapshot; back-solve also failed')
+
+    except Exception as e:
+        print(f'  [ivrank] SPY IV fetch failed — using VIX proxy fallback: {e}')
+        return _vix_ivrank()
+
+    current_iv_pct = current_iv * 100   # decimal → % (e.g. 0.1213 → 12.13)
+
+    # ── Step 2: 252-day Parkinson vol window from SPY OHLC ────────────────────
+    try:
+        df = yf.download('SPY', period=f'{VIX_IVR_WINDOW + 60}d',
+                         interval='1d', progress=False, auto_adjust=True, timeout=10)
+        if df.empty or len(df) < 20:
+            raise ValueError('SPY OHLC data insufficient')
+        df     = _flatten_columns(df)
+        highs  = df['High'].dropna().values.astype(float)
+        lows   = df['Low'].dropna().values.astype(float)
+        n      = min(len(highs), len(lows))
+        log_hl    = np.log(highs[-n:] / lows[-n:])
+        park_ann  = np.sqrt(log_hl ** 2 / (4 * math.log(2))) * math.sqrt(252) * 100
+        window    = park_ann[-VIX_IVR_WINDOW:] if len(park_ann) >= VIX_IVR_WINDOW else park_ann
+        iv_low    = float(window.min())
+        iv_high   = float(window.max())
+
+        if iv_high <= iv_low:
+            raise ValueError('Parkinson IV range is zero')
+
+        ivr = (current_iv_pct - iv_low) / (iv_high - iv_low) * 100
+        ivr = max(0.0, min(100.0, ivr))
+        return round(ivr, 1), round(current_iv_pct, 2)
+
+    except Exception as e:
+        print(f'  [ivrank] Parkinson window failed ({e}) — using VIX proxy fallback')
+        return _vix_ivrank()
 
 
 # ── OPTIONS CHAIN ──────────────────────────────────────────────────────────────
@@ -885,6 +1000,26 @@ def _bs_put_delta(S, K, T_years, sigma):
         return norm.cdf(d1) - 1.0
     except Exception:
         return None
+
+
+def _bs_iv_solve(S, K, T_years, mkt_price):
+    """Bisection IV solver from observed put price. Returns decimal IV (e.g. 0.13)."""
+    if T_years <= 0 or mkt_price <= 0 or S <= 0 or K <= 0:
+        return None
+    lo, hi = 0.001, 5.0
+    r = RISK_FREE_RATE
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        d1  = (math.log(S / K) + (r + 0.5 * mid ** 2) * T_years) / (mid * math.sqrt(T_years))
+        d2  = d1 - mid * math.sqrt(T_years)
+        p   = K * math.exp(-r * T_years) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        if p < mkt_price:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-6:
+            break
+    return (lo + hi) / 2
 
 
 def _find_short_strike(chain, spy_px, expiry, vix, now_str):
@@ -1435,16 +1570,16 @@ def _check_entry_conditions(ticker, pos_state, weekly):
     if not all(v['passed'] for v in conds.values()):
         return False, conds, stock_px, ivr, vix
 
-    # IV rank + VIX cap
-    ivr, vix = _vix_ivrank()
+    # IV rank + IV cap (SPY ATM IV; falls back to VIX proxy if fetch fails)
+    ivr, vix = _spy_ivrank()
     if ivr is None:
-        _c('iv_rank', False, 'VIX data unavailable')
-        _c('vix_cap',  False, 'VIX data unavailable')
+        _c('iv_rank', False, 'SPY IV data unavailable')
+        _c('vix_cap',  False, 'SPY IV data unavailable')
     else:
         _c('iv_rank', ivr >= MIN_IVR,
-           f'IVR={ivr:.1f}% (need ≥{MIN_IVR}%) — VIX={vix:.2f}')
+           f'IVR={ivr:.1f}% (need ≥{MIN_IVR}%) — SPY IV={vix:.1f}%')
         _c('vix_cap',  vix < MAX_VIX,
-           f'VIX={vix:.2f} {"<" if vix < MAX_VIX else "≥"} {MAX_VIX}')
+           f'SPY IV={vix:.1f}% {"<" if vix < MAX_VIX else "≥"} {MAX_VIX:.0f}%')
 
     return all(v['passed'] for v in conds.values()), conds, stock_px, ivr, vix
 
@@ -1657,13 +1792,13 @@ def _send_morning_vitals():
 
     spy_line = _sma_line('SPY', spy_px, spy_sma, spy_above)
 
-    # VIX + IVR
-    ivr, vix = _vix_ivrank()
+    # SPY ATM IV + IVR
+    ivr, vix = _spy_ivrank()
     if vix is not None:
         vix_status = '✅ Clear' if vix < MAX_VIX else '❌ Elevated'
-        vix_line = f'VIX:  {vix:.2f}   |  Limit: <{MAX_VIX:.0f}     |  {vix_status}'
+        vix_line = f'SPY IV: {vix:.1f}%  |  Limit: <{MAX_VIX:.0f}%     |  {vix_status}'
     else:
-        vix_line = 'VIX:  N/A'
+        vix_line = 'SPY IV: N/A'
     if ivr is not None:
         ivr_status = '✅ Clear' if ivr >= MIN_IVR else '❌ Low'
         ivr_line = f'IVR:  {ivr:.1f}%  |  Min: {MIN_IVR:.0f}%       |  {ivr_status}'
