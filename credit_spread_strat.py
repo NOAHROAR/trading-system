@@ -157,6 +157,13 @@ def _alpaca_get(url, **kwargs):
     return None
 
 
+# ── SCHEDULER TIMING ──────────────────────────────────────────────────────────
+# Set by run_scan() so the scheduler loop can report lag and duration.
+
+_last_scan_start:    datetime = None   # ET time the most recent scan began
+_last_scan_duration: float    = 0.0   # seconds the most recent scan took
+
+
 # ── DATABASE ───────────────────────────────────────────────────────────────────
 
 _DB = None  # module-level psycopg2 connection
@@ -350,6 +357,56 @@ def _db_save_positions(ps):
             pass
         global _DB
         _DB = None   # force reconnect on next call
+        return False
+
+
+def _db_read_summary_flags():
+    """Return (daily_summary_sent, morning_vitals_sent) directly from DB state row.
+    Returns (None, None) on DB failure or missing row."""
+    conn = _get_db()
+    if conn is None:
+        return None, None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            'SELECT daily_summary_sent, morning_vitals_sent '
+            'FROM credit_spread_state WHERE id = 1'
+        )
+        row = cur.fetchone()
+        return (row[0], row[1]) if row else (None, None)
+    except Exception as e:
+        print(f'[db] _db_read_summary_flags failed: {e}')
+        return None, None
+
+
+def _db_write_summary_flags(daily_str, vitals_str):
+    """Update only the two summary-flag columns in credit_spread_state.
+    Returns True on success. Used to sync flags to DB when _save_positions
+    fell back to JSON (transient DB failure) — prevents double-fire on recovery."""
+    conn = _get_db()
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE credit_spread_state
+               SET daily_summary_sent  = %s,
+                   morning_vitals_sent = %s
+             WHERE id = 1
+            """,
+            (daily_str, vitals_str),
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f'[db] _db_write_summary_flags failed: {e}')
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        global _DB
+        _DB = None
         return False
 
 
@@ -1112,8 +1169,11 @@ def _spread_mid(chain, short_sym, long_sym):
 def _current_cost_to_close(short_sym, long_sym):
     """
     Current debit to close = short_mid − long_mid.
-    Positive = we pay to close (normal for a short spread). Returns None on error.
+    Positive = we pay to close (normal for a short spread).
+    Returns 0.0 when both legs are zero-priced (deeply OTM near expiry — valid,
+    means max profit reached). Returns None only on hard API failures.
     """
+    ts = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
     try:
         rs = _alpaca_get(
             f'{DATA_URL}/v1beta1/options/snapshots',
@@ -1121,22 +1181,51 @@ def _current_cost_to_close(short_sym, long_sym):
             params={'symbols': f'{short_sym},{long_sym}', 'feed': 'indicative'},
         )
         if rs is None:
+            reason = f'API returned None after retries ({short_sym}, {long_sym})'
+            print(f'  [cost_to_close] {reason}')
+            _log({'timestamp': ts, 'event': 'COST_TO_CLOSE_UNAVAILABLE',
+                  'short_sym': short_sym, 'long_sym': long_sym, 'reason': 'api_none'})
             return None
-        snaps = rs.json().get('snapshots', {})
+
+        body  = rs.json()
+        snaps = body.get('snapshots', {})
+
+        missing = [s for s in (short_sym, long_sym) if s not in snaps]
+        if missing:
+            keys_sample = list(snaps.keys())[:4]
+            reason = (f'symbols absent from snapshot response: {missing} '
+                      f'(response had: {keys_sample})')
+            print(f'  [cost_to_close] {reason}')
+            _log({'timestamp': ts, 'event': 'COST_TO_CLOSE_UNAVAILABLE',
+                  'short_sym': short_sym, 'long_sym': long_sym,
+                  'reason': 'symbols_absent', 'missing': missing,
+                  'response_keys': keys_sample})
+            return None
 
         def _mid(sym):
-            q   = snaps.get(sym, {}).get('latestQuote', {})
+            q   = snaps[sym].get('latestQuote', {})
             bid = float(q.get('bp') or 0)
             ask = float(q.get('ap') or 0)
-            return (bid + ask) / 2.0 if (bid + ask) > 0 else None
+            if bid + ask > 0:
+                return (bid + ask) / 2.0
+            # bid+ask == 0: option is effectively worthless (deeply OTM, near
+            # expiry, or no market).  Treat as 0.00 — a valid zero-cost-to-close
+            # rather than "unavailable", so profit-target monitoring can fire.
+            return 0.0
 
-        s = _mid(short_sym)
-        l = _mid(long_sym)
-        if s is None or l is None:
-            return None
-        return round(s - l, 4)
+        s_mid = _mid(short_sym)
+        l_mid = _mid(long_sym)
+        cost  = round(s_mid - l_mid, 4)
+        if s_mid == 0.0 and l_mid == 0.0:
+            print(f'  [cost_to_close] both legs zero-quoted ({short_sym}, {long_sym})'
+                  f' → cost=0.00 (near-expiry worthless)')
+        return cost
+
     except Exception as e:
-        print(f'  [cost_to_close] {e}')
+        print(f'  [cost_to_close] {type(e).__name__}: {e}')
+        _log({'timestamp': ts, 'event': 'COST_TO_CLOSE_UNAVAILABLE',
+              'short_sym': short_sym, 'long_sym': long_sym,
+              'reason': f'{type(e).__name__}: {e}'})
         return None
 
 
@@ -1659,10 +1748,41 @@ def _check_daily_summary(pos_state, weekly, now_str):
     if not ACTIVE:
         return
     today_str = datetime.now(ET).date().isoformat()
+    # Fast path: in-memory check avoids a DB roundtrip on the majority of scans
     if pos_state.get('daily_summary_sent') == today_str:
         return
     if not _is_summary_time():
         return
+
+    # Authoritative re-read before committing to send.  Two failure modes this
+    # guards against:
+    #
+    # (1) Write-ordering within the same scan: _monitor_positions called
+    #     _save_positions(pos_state) earlier in this scan while
+    #     daily_summary_sent was still None, overwriting a flag that was
+    #     already persisted in DB by a prior scan.
+    #
+    # (2) DB-write-failure / JSON-fallback split-brain: a prior scan's
+    #     _save_positions wrote the flag to JSON (DB was transiently down)
+    #     but not to DB.  When DB recovers, _load_positions reads the stale
+    #     DB state (None) and bypasses the in-memory fast-path above.
+    #
+    # Strategy: check DB first, then JSON.  If either source already has
+    # today's date the alert already fired — sync and return.  If the JSON
+    # has the flag but DB does not, write the flag to DB now (one-time sync).
+    daily_db, vitals_db = _db_read_summary_flags()
+    if daily_db == today_str:
+        pos_state['daily_summary_sent'] = today_str
+        return
+    try:
+        with open(POSITIONS_FILE) as _f:
+            _j = json.load(_f)
+        if _j.get('daily_summary_sent') == today_str:
+            pos_state['daily_summary_sent'] = today_str
+            _db_write_summary_flags(today_str, _j.get('morning_vitals_sent'))
+            return
+    except Exception:
+        pass
 
     pos_state['daily_summary_sent'] = today_str
     _save_positions(pos_state)
@@ -1756,11 +1876,25 @@ def _send_morning_vitals():
         return
 
     today_str = datetime.now(ET).date().isoformat()
-    pos_state = _load_positions()
+    pos_state = _load_positions()   # fresh DB read (or JSON fallback if DB is down)
 
     # Dedup: mark sent BEFORE fetching so a crash mid-fetch doesn't re-fire on restart
     if pos_state.get('morning_vitals_sent') == today_str:
         return
+    # Authoritative JSON check: if a prior scan's _save_positions fell back to
+    # JSON (DB was transiently down), the flag lives only on disk.  When DB
+    # recovers, _load_positions returns the stale DB state (None) and the
+    # in-memory check above passes.  Reading JSON here catches that case and
+    # syncs the flag back to DB in one targeted write.
+    try:
+        with open(POSITIONS_FILE) as _f:
+            _j = json.load(_f)
+        if _j.get('morning_vitals_sent') == today_str:
+            _db_write_summary_flags(_j.get('daily_summary_sent'), today_str)
+            return
+    except Exception:
+        pass
+
     pos_state['morning_vitals_sent'] = today_str
     _save_positions(pos_state)
 
@@ -1857,9 +1991,14 @@ def _send_morning_vitals():
 # ── MAIN SCAN ──────────────────────────────────────────────────────────────────
 
 def run_scan():
+    global _last_scan_start, _last_scan_duration
+    _t0 = datetime.now(ET)
+    _last_scan_start = _t0
+
     if not is_market_hours():
-        print(f'[{datetime.now(ET).strftime("%H:%M ET")}] '
+        print(f'[{_t0.strftime("%H:%M ET")}] '
               f'Credit spread: outside market hours, skipping.')
+        _last_scan_duration = (datetime.now(ET) - _t0).total_seconds()
         return
 
     now_et  = datetime.now(ET)
@@ -1957,6 +2096,9 @@ def run_scan():
                     print(f'  [{t}] No entry — failed: {", ".join(fails)}')
 
     # ── 5. Log scan ────────────────────────────────────────────────────────────
+    _last_scan_duration = (datetime.now(ET) - _t0).total_seconds()
+    print(f'  [run_scan] completed in {_last_scan_duration:.1f}s')
+
     log_entry = {
         'timestamp':      now_str,
         'event':          'SCAN',
@@ -1965,6 +2107,7 @@ def run_scan():
         'open_positions': len(pos_state.get('positions', [])),
         'weekly_loss':    weekly.get('weekly_realized_loss', 0.0),
         'cooldown':       weekly.get('cooldown_active', False),
+        'scan_duration_s': round(_last_scan_duration, 1),
         'conditions':     ticker_conds,
     }
     if scan_result in ('dormant_would_enter', 'entry_filled', 'entry_not_filled') and chosen:
@@ -2010,12 +2153,33 @@ def main():
     run_scan()
 
     while True:
+        tick_et  = datetime.now(ET)
+        tick_str = tick_et.strftime('%Y-%m-%d %H:%M:%S ET')
+
+        # ── Scheduler tick diagnostics (market hours only) ────────────────────
+        if is_market_hours():
+            if _last_scan_start is not None:
+                since_s = (tick_et - _last_scan_start).total_seconds()
+                print(f'[scheduler] tick {tick_str} | '
+                      f'last_scan_start={_last_scan_start.strftime("%H:%M:%S")} | '
+                      f'since={since_s:.0f}s | '
+                      f'last_duration={_last_scan_duration:.1f}s')
+
+                if since_s > 600:   # 10-minute watchdog
+                    lag_min = round(since_s / 60, 1)
+                    print(f'[scheduler] ⚠️  SCHEDULER_LAG — {lag_min} min since last scan started')
+                    _log({'timestamp': tick_str, 'event': 'SCHEDULER_LAG',
+                          'minutes_since_last_scan': lag_min,
+                          'last_scan_duration_s': _last_scan_duration})
+            else:
+                print(f'[scheduler] tick {tick_str} | awaiting first scan')
+
         try:
             schedule.run_pending()
         except Exception as e:
             print(f'[scheduler] ERROR — {type(e).__name__}: {e}')
-            _log({'timestamp': datetime.now(ET).strftime('%Y-%m-%d %H:%M ET'),
-                  'event': 'SCHEDULER_ERROR', 'error': f'{type(e).__name__}: {e}'})
+            _log({'timestamp': tick_str, 'event': 'SCHEDULER_ERROR',
+                  'error': f'{type(e).__name__}: {e}'})
         time.sleep(30)
 
 
