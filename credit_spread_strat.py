@@ -211,8 +211,14 @@ def _init_db():
                 weekly_realized_loss DOUBLE PRECISION DEFAULT 0.0,
                 cooldown_active      BOOLEAN DEFAULT FALSE,
                 week_start_date      TEXT,
-                daily_summary_sent   TEXT
+                daily_summary_sent   TEXT,
+                morning_vitals_sent  TEXT
             )
+        """)
+        # Safe migration: add column if an older schema exists
+        cur.execute("""
+            ALTER TABLE credit_spread_state
+            ADD COLUMN IF NOT EXISTS morning_vitals_sent TEXT
         """)
         conn.commit()
         print('[db] Connected to PostgreSQL — persistent storage active')
@@ -282,9 +288,16 @@ def _db_load_positions():
                 pos['note'] = row[15]
             positions.append(pos)
 
-        cur.execute('SELECT daily_summary_sent FROM credit_spread_state WHERE id = 1')
+        cur.execute("""
+            SELECT daily_summary_sent, morning_vitals_sent
+            FROM credit_spread_state WHERE id = 1
+        """)
         row = cur.fetchone()
-        return {'positions': positions, 'daily_summary_sent': row[0] if row else None}
+        return {
+            'positions':           positions,
+            'daily_summary_sent':  row[0] if row else None,
+            'morning_vitals_sent': row[1] if row else None,
+        }
     except Exception as e:
         print(f'[db] _db_load_positions failed: {e}')
         global _DB
@@ -320,10 +333,12 @@ def _db_save_positions(ps):
                 pos.get('note'),
             ))
         cur.execute("""
-            INSERT INTO credit_spread_state (id, daily_summary_sent)
-            VALUES (1, %s)
-            ON CONFLICT (id) DO UPDATE SET daily_summary_sent = EXCLUDED.daily_summary_sent
-        """, (ps.get('daily_summary_sent'),))
+            INSERT INTO credit_spread_state (id, daily_summary_sent, morning_vitals_sent)
+            VALUES (1, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                daily_summary_sent  = EXCLUDED.daily_summary_sent,
+                morning_vitals_sent = EXCLUDED.morning_vitals_sent
+        """, (ps.get('daily_summary_sent'), ps.get('morning_vitals_sent')))
         conn.commit()
         return True
     except Exception as e:
@@ -1591,6 +1606,122 @@ def _check_daily_summary(pos_state, weekly, now_str):
     )
 
 
+# ── MORNING VITALS ─────────────────────────────────────────────────────────────
+
+def _send_morning_vitals():
+    """
+    Post a market-open snapshot to Discord once per trading day at 9:30 ET.
+    Dedup flag: pos_state['morning_vitals_sent'] == today's date (stored in DB).
+    Holiday check: Alpaca /v2/calendar — skips silently if market is closed.
+    Called from run_scan() when ET clock is in the 9:30–9:34 window.
+    NOTE: schedule.every().day.at("09:30") cannot be used directly on a UTC
+          Railway container — this is triggered via run_scan's ET time check instead.
+    """
+    if not ACTIVE:
+        return
+
+    today_str = datetime.now(ET).date().isoformat()
+    pos_state = _load_positions()
+
+    # Dedup: mark sent BEFORE fetching so a crash mid-fetch doesn't re-fire on restart
+    if pos_state.get('morning_vitals_sent') == today_str:
+        return
+    pos_state['morning_vitals_sent'] = today_str
+    _save_positions(pos_state)
+
+    # Holiday check via Alpaca calendar endpoint
+    try:
+        cal = _alpaca_get(
+            f'{PAPER_BASE_URL}/v2/calendar',
+            headers=_headers(),
+            params={'start': today_str, 'end': today_str},
+        )
+        if cal is None or not cal.json():
+            print(f'  [morning_vitals] market holiday ({today_str}) — skipping')
+            return
+    except Exception as e:
+        print(f'  [morning_vitals] calendar check failed: {e} — sending anyway')
+
+    weekly   = _load_weekly()
+    now_et   = datetime.now(ET)
+    date_str = now_et.strftime('%A %B %-d, %Y')
+
+    # SPY / QQQ price + SMA20
+    spy_above, spy_px, spy_sma = _above_sma20('SPY')
+    qqq_above, qqq_px, qqq_sma = _above_sma20('QQQ')
+
+    def _sma_line(ticker, px, sma, above):
+        if px is None or sma is None:
+            return f'{ticker}:  N/A'
+        status = '✅ Above' if above else '❌ Below'
+        return f'{ticker}:  ${px:.2f}  |  SMA20: ${sma:.2f}  |  {status}'
+
+    spy_line = _sma_line('SPY', spy_px, spy_sma, spy_above)
+    qqq_line = _sma_line('QQQ', qqq_px, qqq_sma, qqq_above)
+
+    # VIX + IVR
+    ivr, vix = _vix_ivrank()
+    if vix is not None:
+        vix_status = '✅ Clear' if vix < MAX_VIX else '❌ Elevated'
+        vix_line = f'VIX:  {vix:.2f}   |  Limit: <{MAX_VIX:.0f}     |  {vix_status}'
+    else:
+        vix_line = 'VIX:  N/A'
+    if ivr is not None:
+        ivr_status = '✅ Clear' if ivr >= MIN_IVR else '❌ Low'
+        ivr_line = f'IVR:  {ivr:.1f}%  |  Min: {MIN_IVR:.0f}%       |  {ivr_status}'
+    else:
+        ivr_line = 'IVR:  N/A'
+
+    # Macro event
+    macro = _macro_event_today()
+    if macro:
+        macro_line = f'MACRO: {macro}  |  ⚠️ Blocked'
+    else:
+        macro_line = 'MACRO: None scheduled  |  ✅ Clear'
+
+    # Open positions with live cost-to-close
+    real_pos = [p for p in pos_state.get('positions', [])
+                if not (p.get('reconciled') and p.get('short_symbol') == 'UNKNOWN')]
+    pos_lines = f'OPEN POSITIONS: {len(real_pos)} of {MAX_POSITIONS}'
+    for pos in real_pos:
+        tkr    = pos.get('ticker', pos.get('short_symbol', 'SPY')[:3])
+        credit = pos.get('credit', 0)
+        cost   = _current_cost_to_close(pos.get('short_symbol', ''),
+                                        pos.get('long_symbol', ''))
+        if cost is not None and credit > 0:
+            pct_str = f'  ({(credit - cost) / credit * 100:.0f}% to target)'
+        else:
+            pct_str = ''
+        cost_str = f'${cost:.4f}' if cost is not None else 'N/A'
+        pos_lines += (
+            f'\n  [{tkr}] {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P'
+            f'  exp {pos["expiration"]}'
+            f'  cost {cost_str} / credit ${credit:.2f}'
+            f'{pct_str}'
+        )
+
+    # Week P&L (weekly_realized_loss is a net-loss accumulator, floor 0)
+    week_loss = weekly.get('weekly_realized_loss', 0.0)
+    week_str  = f'-${week_loss:.2f}' if week_loss > 0 else '+$0.00'
+    system_line = f'SYSTEM: ✅ Active  |  Week P&L: {week_str}'
+
+    msg = (
+        f'📊 **MORNING VITALS — {date_str}**\n\n'
+        f'{spy_line}\n'
+        f'{qqq_line}\n'
+        f'{vix_line}\n'
+        f'{ivr_line}\n'
+        f'{macro_line}\n\n'
+        f'{pos_lines}\n\n'
+        f'{system_line}'
+    )
+
+    _discord(msg)
+    print(f'  [morning_vitals] sent for {today_str}')
+    _log({'timestamp': datetime.now(ET).strftime('%Y-%m-%d %H:%M ET'),
+          'event': 'MORNING_VITALS_SENT', 'date': today_str})
+
+
 # ── MAIN SCAN ──────────────────────────────────────────────────────────────────
 
 def run_scan():
@@ -1599,7 +1730,20 @@ def run_scan():
               f'Credit spread: outside market hours, skipping.')
         return
 
-    now_str = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
+    now_et  = datetime.now(ET)
+    now_str = now_et.strftime('%Y-%m-%d %H:%M ET')
+
+    # ── 0. Morning vitals — fires once at 9:30 ET each trading day ────────────
+    # schedule.every().day.at("09:30") cannot target ET on a UTC Railway container,
+    # so we check ET time directly inside the 5-minute scan loop instead.
+    if now_et.hour == 9 and 30 <= now_et.minute < 35:
+        try:
+            _send_morning_vitals()
+        except Exception as e:
+            print(f'  [morning_vitals] ERROR — {type(e).__name__}: {e}')
+            _log({'timestamp': now_str, 'event': 'MORNING_VITALS_ERROR',
+                  'error': f'{type(e).__name__}: {e}'})
+
     print(f'\n[{now_str}] Credit spread scan  (ACTIVE={ACTIVE})…')
 
     pos_state = _load_positions()
