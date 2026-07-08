@@ -33,6 +33,7 @@ import json
 import math
 import os
 import time
+import traceback
 from datetime import date, datetime, timedelta
 
 import numpy as np
@@ -218,6 +219,90 @@ def _init_db():
             pass
 
 
+def _db_probe():
+    """
+    Startup write test: INSERT a sentinel row then DELETE it immediately.
+    Uses the identical column list and parameterisation as _db_insert_position.
+    Logs the full exception traceback — not just str(e) — to stdout and Discord
+    so the real root cause is visible on the next deploy without waiting for a
+    live trade attempt.
+    """
+    global _DB
+
+    conn = _get_db()
+    if conn is None:
+        msg = (f'[db] _db_probe: no DB connection available '
+               f'(DATABASE_URL set: {bool(DATABASE_URL)}, '
+               f'psycopg2 installed: {psycopg2 is not None})')
+        print(msg)
+        _discord(
+            f'[0DTE ALERT] ⚠️ Startup DB probe: no connection. '
+            f'DATABASE_URL set: {bool(DATABASE_URL)}  '
+            f'psycopg2 installed: {psycopg2 is not None}. '
+            f'DB writes will silently fail — positions will NOT be persisted.'
+        )
+        return
+
+    # ── INSERT ────────────────────────────────────────────────────────────────
+    probe_id = None
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO dte0_positions (
+                short_symbol, long_symbol, short_strike, long_strike,
+                expiration, credit, max_risk, breakeven, profit_target,
+                stop_loss_cost, entry_time, entry_order_id, short_delta,
+                spy_entry_px
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+        """, (
+            '__PROBE__', '__PROBE__', 0.0, 0.0,
+            '1970-01-01', 0.0, 0.0, 0.0, 0.0,
+            0.0, 'STARTUP PROBE', None, None, None,
+        ))
+        probe_id = cur.fetchone()[0]
+        conn.commit()
+        print(f'[db] _db_probe: INSERT ok (probe row id={probe_id})')
+    except Exception:
+        tb = traceback.format_exc()
+        print(f'[db] _db_probe: INSERT FAILED\n{tb}')
+        # Truncate to stay within Discord's 2000-char message limit
+        tb_snip = tb[-1700:] if len(tb) > 1700 else tb
+        _discord(
+            f'[0DTE ALERT] 🚨 Startup DB probe INSERT FAILED — '
+            f'this is why positions are not being persisted to dte0_positions.\n'
+            f'```\n{tb_snip}\n```'
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _DB = None
+        return
+
+    # ── DELETE ────────────────────────────────────────────────────────────────
+    try:
+        cur = conn.cursor()
+        cur.execute('DELETE FROM dte0_positions WHERE id = %s AND short_symbol = %s',
+                    (probe_id, '__PROBE__'))
+        conn.commit()
+        print(f'[db] _db_probe: DELETE ok — DB write test PASSED ✓')
+    except Exception:
+        tb = traceback.format_exc()
+        print(f'[db] _db_probe: DELETE FAILED (probe row id={probe_id} left in table)\n{tb}')
+        tb_snip = tb[-1700:] if len(tb) > 1700 else tb
+        _discord(
+            f'[0DTE ALERT] ⚠️ Startup DB probe DELETE failed '
+            f'(probe row id={probe_id} may remain in dte0_positions — safe to delete manually).\n'
+            f'```\n{tb_snip}\n```'
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _DB = None
+
+
 def _db_load_active_position():
     """
     Return the single open dte0 position (close_time IS NULL) for today, or None.
@@ -340,21 +425,40 @@ def _db_close_position(db_id, close_time, close_reason, realized_pnl):
 
 def _db_mark_stale_open_expired(today_str):
     """
-    On startup: mark any open positions with expiration < today as EXPIRED_UNTRACKED.
-    0DTE options from a prior day expired at market close — realized_pnl is unknown.
+    On startup: mark open positions that have already expired as EXPIRED_UNTRACKED.
+
+    Two cases:
+      expiration < today  — prior trading day; definitely expired
+      expiration = today  — 0DTE positions from today; expired only if we are
+                            starting after 4:00pm ET (market close has passed)
     """
     conn = _get_db()
     if conn is None:
         return
     try:
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE dte0_positions
-               SET close_time   = %s,
-                   close_reason = 'EXPIRED_UNTRACKED',
-                   realized_pnl = NULL
-             WHERE close_time IS NULL AND expiration < %s
-        """, (today_str + ' 16:00 ET (startup cleanup)', today_str))
+        cur          = conn.cursor()
+        after_close  = datetime.now(ET).hour >= 16
+        close_ts     = today_str + ' 16:00 ET (startup cleanup)'
+
+        if after_close:
+            # Clean prior-day AND today's 0DTE positions — all have expired
+            cur.execute("""
+                UPDATE dte0_positions
+                   SET close_time   = %s,
+                       close_reason = 'EXPIRED_UNTRACKED',
+                       realized_pnl = NULL
+                 WHERE close_time IS NULL AND expiration <= %s
+            """, (close_ts, today_str))
+        else:
+            # Before market close — only clean prior-day rows; today's may still be live
+            cur.execute("""
+                UPDATE dte0_positions
+                   SET close_time   = %s,
+                       close_reason = 'EXPIRED_UNTRACKED',
+                       realized_pnl = NULL
+                 WHERE close_time IS NULL AND expiration < %s
+            """, (close_ts, today_str))
+
         n = cur.rowcount
         conn.commit()
         if n:
@@ -1829,6 +1933,7 @@ def main():
     print('=' * 64)
 
     _init_db()
+    _db_probe()
     _reconcile_on_startup()
 
     schedule.every(60).seconds.do(run_scan)

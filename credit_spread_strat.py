@@ -680,10 +680,12 @@ def _reconcile_on_startup():
         r = _alpaca_get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers())
         if r is None:
             raise RuntimeError('positions fetch returned None after retries')
+        today_ymd   = datetime.now(ET).strftime('%y%m%d')
         option_legs = [
             p for p in r.json()
             if p.get('asset_class') == 'us_option'
             and any(str(p.get('symbol', '')).startswith(t) for t in TICKERS)
+            and str(p.get('symbol', ''))[3:9] != today_ymd   # ignore 0DTE legs (dte0_strat.py handles those)
         ]
         expected_legs = len(pos_state.get('positions', [])) * 2
         actual_legs   = len(option_legs)
@@ -1827,9 +1829,11 @@ def _check_daily_summary(pos_state, weekly, now_str):
     try:
         r = _alpaca_get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers())
         if r is not None:
+            today_ymd    = datetime.now(ET).strftime('%y%m%d')
             tracked_legs = [p for p in r.json()
                             if p.get('asset_class') == 'us_option'
-                            and any(str(p.get('symbol', '')).startswith(t) for t in TICKERS)]
+                            and any(str(p.get('symbol', '')).startswith(t) for t in TICKERS)
+                            and str(p.get('symbol', ''))[3:9] != today_ymd]
             alpaca_spreads = len(tracked_legs) // 2
             file_spreads   = len(real_pos)
             if alpaca_spreads != file_spreads:
