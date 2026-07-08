@@ -217,6 +217,8 @@ def _init_db():
             conn.rollback()
         except Exception:
             pass
+        global _DB
+        _DB = None
 
 
 def _db_probe():
@@ -469,6 +471,8 @@ def _db_mark_stale_open_expired(today_str):
             conn.rollback()
         except Exception:
             pass
+        global _DB
+        _DB = None
 
 
 def _db_get_today_closed(today_str):
