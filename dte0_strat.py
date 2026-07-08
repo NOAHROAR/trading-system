@@ -51,14 +51,12 @@ except ImportError:
 load_dotenv()
 
 # ── ACTIVATION FLAG ────────────────────────────────────────────────────────────
-ACTIVE = False   # Set to True to enable live order placement
+ACTIVE = True    # Set to True to enable live order placement
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK  = os.getenv('DISCORD_WEBHOOK_URL')
 ALPACA_KEY       = os.getenv('ALPACA_KEY')
 ALPACA_SECRET    = os.getenv('ALPACA_SECRET')
-print(f'ALPACA_KEY loaded: {ALPACA_KEY[:4]}****' if ALPACA_KEY else 'ALPACA_KEY: NOT SET')
-print(f'ALPACA_SECRET loaded: {ALPACA_SECRET[:4]}****' if ALPACA_SECRET else 'ALPACA_SECRET: NOT SET')
 PAPER_BASE_URL   = 'https://paper-api.alpaca.markets'
 DATA_URL         = 'https://data.alpaca.markets'
 DATABASE_URL     = os.getenv('DATABASE_URL')
