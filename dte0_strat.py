@@ -296,6 +296,12 @@ def _db_insert_position(pos):
         return row_id
     except Exception as e:
         print(f'[db] _db_insert_position failed: {e}')
+        _discord(
+            f'[0DTE ALERT] 🚨 DB INSERT FAILED — position NOT persisted to dte0_positions. '
+            f'Error: {e}. '
+            f'In-memory tracking active but MAX_POSITIONS=1 will not survive a restart. '
+            f'Check Railway logs immediately.'
+        )
         try:
             conn.rollback()
         except Exception:
@@ -436,14 +442,41 @@ _mem_position          = None   # active position dict, or None
 _mem_daily_summary     = None   # date string if sent today
 _mem_morning_vitals    = None   # date string if sent today
 _mem_today_trades      = []     # closed trades today (for summary when DB is down)
+_db_conflict_alerted   = False  # rate-limit the DB/mem mismatch Discord alert
 
 
 def _load_active_position():
-    """Load active position: DB primary, in-memory fallback."""
+    """
+    Load active position. DB is primary; in-memory is the fallback.
+
+    Conflict rule: if DB is reachable but returns no open row while _mem_position
+    is set, the DB write for this process's last fill likely failed silently.
+    Prefer _mem_position (what this process actually did) and alert via Discord
+    so a human can investigate. Rate-limited to one alert per session.
+    """
+    global _db_conflict_alerted
     if DATABASE_URL:
         result = _db_load_active_position()
-        if result is not None or _get_db() is not None:
+        if result is not None:
             return result
+        # DB returned None — check whether in-process memory disagrees
+        if _mem_position is not None:
+            print('[db] STATE CONFLICT: DB has no open row but _mem_position is set '
+                  f'— returning in-memory position ({_mem_position.get("short_symbol","?")})')
+            if not _db_conflict_alerted:
+                _db_conflict_alerted = True
+                _discord(
+                    f'[0DTE ALERT] ⚠️ DB/memory state conflict: DB shows no open position '
+                    f'but this process has '
+                    f'{_mem_position.get("short_symbol","?")} / {_mem_position.get("long_symbol","?")} '
+                    f'in memory (entry {_mem_position.get("entry_time","?")}). '
+                    f'DB write likely failed — new entries are BLOCKED. '
+                    f'Check Railway logs for [db] _db_insert_position failed.'
+                )
+            return _mem_position
+        # DB reachable, both DB and memory agree: no open position
+        if _get_db() is not None:
+            return None
         print('[db] _load_active_position: DB unavailable, using in-memory')
     return _mem_position
 
@@ -1345,6 +1378,16 @@ def _check_entry_conditions(pos):
     _c('active',         ACTIVE,           'True' if ACTIVE else 'False — DORMANT')
     _c('entry_window',   _in_entry_window(), '9:45–11:00 ET')
     _c('position_limit', pos is None,       '0/1 open' if pos is None else '1/1 — position open')
+
+    # Belt-and-suspenders: _mem_position is the in-process source of truth.
+    # If it is set but pos is None (DB returned nothing), the DB write for a prior
+    # fill likely failed. Block the entry unconditionally regardless of DB state.
+    if _mem_position is not None and pos is None:
+        _c('mem_position_guard', False,
+           f'in-memory position exists '
+           f'({_mem_position.get("short_symbol","?")} / {_mem_position.get("long_symbol","?")} '
+           f'entry {_mem_position.get("entry_time","?")}) but DB returned no row — '
+           f'blocking new entry to prevent duplicate spread')
 
     if not all(v['passed'] for v in conds.values()):
         return False, conds, spy_px, ivr, vix
