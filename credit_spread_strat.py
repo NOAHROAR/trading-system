@@ -163,6 +163,16 @@ def _alpaca_get(url, **kwargs):
 _last_scan_start:    datetime = None   # ET time the most recent scan began
 _last_scan_duration: float    = 0.0   # seconds the most recent scan took
 
+# ── MONITOR RELIABILITY STATE ──────────────────────────────────────────────────
+# In-memory; resets on process restart. Alert threshold ensures a human is paged
+# well before the stale cache window expires on a sustained API outage.
+_last_known_cost:     dict = {}  # (short_sym, long_sym) → {'cost': float, 'ts': datetime}
+_monitor_consec_fail: dict = {}  # (short_sym, long_sym) → consecutive failure count
+_monitor_alert_sent:  set  = set()  # keys where degraded-monitoring Discord alert fired
+
+STALE_COST_MAX_MINUTES  = 30  # use cached price for stop-loss fallback only within this window
+MONITOR_ALERT_THRESHOLD = 3   # consecutive failures before degraded-monitoring Discord alert
+
 
 # ── DATABASE ───────────────────────────────────────────────────────────────────
 
@@ -1177,11 +1187,17 @@ def _current_cost_to_close(short_sym, long_sym):
     """
     ts = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
     try:
-        rs = _alpaca_get(
-            f'{DATA_URL}/v1beta1/options/snapshots',
-            headers=_data_headers(),
-            params={'symbols': f'{short_sym},{long_sym}', 'feed': 'indicative'},
-        )
+        rs = None
+        for _outer in range(2):
+            rs = _alpaca_get(
+                f'{DATA_URL}/v1beta1/options/snapshots',
+                headers=_data_headers(),
+                params={'symbols': f'{short_sym},{long_sym}', 'feed': 'indicative'},
+            )
+            if rs is not None:
+                break
+            if _outer == 0:
+                time.sleep(5)   # one 5s pause before second full attempt
         if rs is None:
             reason = f'API returned None after retries ({short_sym}, {long_sym})'
             print(f'  [cost_to_close] {reason}')
@@ -1524,12 +1540,61 @@ def _monitor_positions(pos_state, weekly, now_str):
                 continue
 
             # ── Current spread value ──────────────────────────────────────────
+            _cost_key = (short_sym, long_sym)
             cost = _current_cost_to_close(short_sym, long_sym)
             if cost is None:
-                print(f'  {label}: value unavailable — skipping this cycle')
+                fail_count = _monitor_consec_fail.get(_cost_key, 0) + 1
+                _monitor_consec_fail[_cost_key] = fail_count
+                cached = _last_known_cost.get(_cost_key)
+                stale_cost = stale_age_min = None
+                if cached:
+                    stale_age_min = (datetime.now(ET) - cached['ts']).total_seconds() / 60
+                    if stale_age_min <= STALE_COST_MAX_MINUTES:
+                        stale_cost = cached['cost']
+                age_str = f'{stale_age_min:.0f}min ago' if stale_age_min is not None else 'never'
+                print(f'  {label}: value unavailable — skipping this cycle '
+                      f'({fail_count} consecutive; last good: {age_str})')
                 _log({'timestamp': now_str, 'event': 'MONITOR_VALUE_UNAVAILABLE',
-                      'label': label})
+                      'label': label, 'consecutive_failures': fail_count,
+                      'stale_cost': stale_cost,
+                      'stale_age_min': round(stale_age_min, 1) if stale_age_min is not None else None})
+                if fail_count >= MONITOR_ALERT_THRESHOLD and _cost_key not in _monitor_alert_sent:
+                    _monitor_alert_sent.add(_cost_key)
+                    _discord(
+                        f'⚠️ STOP-LOSS MONITORING DEGRADED | {label} | '
+                        f'{fail_count} consecutive pricing failures (~{fail_count * 5} min). '
+                        f'Last good price: {age_str}. '
+                        f'Stop at ${pos["stop_loss_cost"]:.2f} (2× credit ${credit:.2f}) '
+                        f'cannot be auto-enforced. Manual monitoring required.'
+                    )
+                if stale_cost is not None and stale_cost >= pos['stop_loss_cost']:
+                    print(f'  {label}: STALE-PRICE STOP LOSS '
+                          f'(cached {stale_cost:.4f} from {stale_age_min:.0f}min ago '
+                          f'>= stop {pos["stop_loss_cost"]:.4f})')
+                    _log({'timestamp': now_str, 'event': 'MONITOR_STALE_STOP_LOSS',
+                          'label': label, 'stale_cost': stale_cost,
+                          'stale_age_min': round(stale_age_min, 1)})
+                    _discord(
+                        f'⚠️ STOP-LOSS TRIGGERED ON STALE PRICE | {label} | '
+                        f'Live quotes unavailable; cached cost ${stale_cost:.4f} '
+                        f'({stale_age_min:.0f}min old) ≥ stop ${pos["stop_loss_cost"]:.4f}. '
+                        f'Placing market close order.'
+                    )
+                    ok = _place_close_order(short_sym, long_sym, order_type='market')
+                    if ok:
+                        _record_exit(pos_state, weekly, pos, 'STOP_LOSS', stale_cost, now_str)
+                        to_close.append(pos)
+                    else:
+                        _discord(
+                            f'🚨 STALE-PRICE STOP LOSS ORDER FAILED | {label} | '
+                            f'Manual close required immediately.'
+                        )
                 continue
+
+            # Update last-known-good cache and reset failure counters on success
+            _last_known_cost[_cost_key] = {'cost': cost, 'ts': datetime.now(ET)}
+            _monitor_consec_fail[_cost_key] = 0
+            _monitor_alert_sent.discard(_cost_key)   # allow re-alert if degradation recurs later
 
             print(f'  {label}: cost={cost:.4f}  credit={credit:.4f}  '
                   f'tgt≤{pos["profit_target"]:.4f}  stop≥{pos["stop_loss_cost"]:.4f}')
