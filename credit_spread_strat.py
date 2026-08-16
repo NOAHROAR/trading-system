@@ -238,6 +238,10 @@ def _init_db():
             ALTER TABLE credit_spread_state
             ADD COLUMN IF NOT EXISTS morning_vitals_sent TEXT
         """)
+        cur.execute("""
+            ALTER TABLE credit_spread_positions
+            ADD COLUMN IF NOT EXISTS pending_close_order_id TEXT
+        """)
         conn.commit()
         print('[db] Connected to PostgreSQL — persistent storage active')
 
@@ -279,7 +283,7 @@ def _db_load_positions():
             SELECT short_symbol, long_symbol, short_strike, long_strike,
                    expiration, credit, max_risk, breakeven, profit_target,
                    stop_loss_cost, open_time, entry_order_id, short_delta,
-                   spy_entry_px, reconciled, note
+                   spy_entry_px, reconciled, note, pending_close_order_id
             FROM credit_spread_positions ORDER BY id
         """)
         positions = []
@@ -304,6 +308,8 @@ def _db_load_positions():
                 pos['reconciled'] = True
             if row[15]:
                 pos['note'] = row[15]
+            if row[16]:
+                pos['pending_close_order_id'] = row[16]
             positions.append(pos)
 
         cur.execute("""
@@ -337,8 +343,8 @@ def _db_save_positions(ps):
                     short_symbol, long_symbol, short_strike, long_strike,
                     expiration, credit, max_risk, breakeven, profit_target,
                     stop_loss_cost, open_time, entry_order_id, short_delta,
-                    spy_entry_px, reconciled, note
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    spy_entry_px, reconciled, note, pending_close_order_id
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
                 pos.get('short_symbol'),    pos.get('long_symbol'),
                 pos.get('short_strike'),    pos.get('long_strike'),
@@ -349,6 +355,7 @@ def _db_save_positions(ps):
                 pos.get('short_delta'),     pos.get('spy_entry_px'),
                 bool(pos.get('reconciled', False)),
                 pos.get('note'),
+                pos.get('pending_close_order_id'),
             ))
         cur.execute("""
             INSERT INTO credit_spread_state (id, daily_summary_sent, morning_vitals_sent)
@@ -1501,9 +1508,10 @@ def _monitor_positions(pos_state, weekly, now_str):
     if not positions:
         return
 
-    today    = datetime.now(ET).date()   # ET date — Railway container runs in UTC
-    now_et   = datetime.now(ET)
-    to_close = []
+    today             = datetime.now(ET).date()   # ET date — Railway container runs in UTC
+    now_et            = datetime.now(ET)
+    to_close          = []
+    positions_updated = False   # True if pending_close_order_id changed without a full exit
 
     for pos in positions:
         # Skip placeholder entries added by startup reconciliation for untracked Alpaca positions
@@ -1519,6 +1527,67 @@ def _monitor_positions(pos_state, weekly, now_str):
         label     = f'{tkr} {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P {expiry}'
 
         try:
+            # ── Check pending profit-target close order ────────────────────────
+            pending_id = pos.get('pending_close_order_id')
+            if pending_id:
+                order    = _get_order(pending_id)
+                o_status = order.get('status', '') if order else ''
+
+                if o_status == 'filled':
+                    fill_cost = float(order['filled_avg_price'])
+                    print(f'  {label}: pending close CONFIRMED FILLED (cost=${fill_cost:.4f})')
+                    _log({'timestamp': now_str, 'event': 'PROFIT_TARGET_CLOSE_CONFIRMED',
+                          'label': label, 'order_id': pending_id, 'fill_cost': fill_cost})
+                    _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET', fill_cost, now_str)
+                    to_close.append(pos)
+                    continue
+
+                if o_status in ('expired', 'cancelled', 'rejected', 'done_for_day'):
+                    print(f'  {label}: pending close {o_status} — retrying with market order')
+                    _log({'timestamp': now_str, 'event': 'PROFIT_TARGET_CLOSE_EXPIRED',
+                          'label': label, 'order_id': pending_id, 'order_status': o_status})
+                    _discord(
+                        f'⚠️ PROFIT-TARGET CLOSE EXPIRED UNFILLED | {label} | '
+                        f'Day-limit {pending_id[:8]}… {o_status}. '
+                        f'Retrying with market order now.'
+                    )
+                    pos['pending_close_order_id'] = None
+                    positions_updated = True
+                    curr_cost = _current_cost_to_close(short_sym, long_sym) or pos['profit_target']
+                    retry_ok  = _place_close_order(short_sym, long_sym, order_type='market')
+                    if retry_ok:
+                        _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET', curr_cost, now_str)
+                        to_close.append(pos)
+                    else:
+                        _discord(
+                            f'🚨 MARKET RETRY ALSO FAILED | {label} | '
+                            f'Could not close after limit expiry. Manual close required in Alpaca.'
+                        )
+                    continue
+
+                # Order still open/pending — check stop-loss override before waiting
+                curr_cost_check = _current_cost_to_close(short_sym, long_sym)
+                if curr_cost_check is not None and curr_cost_check >= pos['stop_loss_cost']:
+                    print(f'  {label}: STOP LOSS overrides pending profit-target close')
+                    _cancel_order(pending_id)
+                    pos['pending_close_order_id'] = None
+                    positions_updated = True
+                    ok = _place_close_order(short_sym, long_sym, order_type='market')
+                    if ok:
+                        _record_exit(pos_state, weekly, pos, 'STOP_LOSS', curr_cost_check, now_str)
+                        to_close.append(pos)
+                    else:
+                        _log({'timestamp': now_str, 'event': 'CLOSE_ORDER_FAILED',
+                              'label': label, 'reason': 'STOP_LOSS'})
+                        _discord(f'⚠️ Close order failed | {label} | Stop loss | Retrying next scan')
+                    continue
+
+                if order is None:
+                    print(f'  {label}: pending close {pending_id[:8]}… — order query failed, skipping')
+                else:
+                    print(f'  {label}: pending close {pending_id[:8]}… still {o_status} — waiting')
+                continue
+
             # ── Expiration force-close (9:45am ET on expiry day) ─────────────
             if today == expiry and now_et.hour == 9 and now_et.minute >= 45:
                 print(f'  {label}: EXPIRATION CLOSE')
@@ -1602,12 +1671,15 @@ def _monitor_positions(pos_state, weekly, now_str):
             # ── Profit target: cost ≤ 50% of original credit ─────────────────
             if cost <= pos['profit_target']:
                 print(f'  {label}: PROFIT TARGET')
-                ok = _place_close_order(short_sym, long_sym,
-                                        order_type='limit',
-                                        limit_price=pos['profit_target'])
-                if ok:
-                    _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET', cost, now_str)
-                    to_close.append(pos)
+                order_id = _place_close_order(short_sym, long_sym,
+                                              order_type='limit',
+                                              limit_price=pos['profit_target'])
+                if order_id:
+                    pos['pending_close_order_id'] = order_id
+                    positions_updated = True
+                    _log({'timestamp': now_str, 'event': 'PROFIT_TARGET_CLOSE_SUBMITTED',
+                          'label': label, 'order_id': order_id,
+                          'limit_price': pos['profit_target']})
                 else:
                     print(f'  {label}: profit-target close failed — retrying next cycle')
                     _log({'timestamp': now_str, 'event': 'CLOSE_ORDER_FAILED',
@@ -1641,6 +1713,8 @@ def _monitor_positions(pos_state, weekly, now_str):
                 pass
         _save_positions(pos_state)
         _save_weekly(weekly)
+    elif positions_updated:
+        _save_positions(pos_state)
 
 
 # ── MACRO EVENT FILTER ─────────────────────────────────────────────────────────
