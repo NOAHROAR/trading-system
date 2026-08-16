@@ -704,6 +704,32 @@ def _reconcile_on_startup():
             and any(str(p.get('symbol', '')).startswith(t) for t in TICKERS)
             and str(p.get('symbol', ''))[3:9] != today_ymd   # ignore 0DTE legs (dte0_strat.py handles those)
         ]
+        # Resolve positions whose profit-target close order filled while the process was down.
+        # Must happen before expected_legs is computed so a filled-but-unconfirmed position
+        # doesn't count toward expected_legs and trigger a false mismatch alert.
+        resolved_pending = []
+        for pos in pos_state.get('positions', []):
+            pending_id = pos.get('pending_close_order_id')
+            if not pending_id:
+                continue
+            order = _get_order(pending_id)
+            if order and order.get('status') == 'filled':
+                fill_cost = float(order['filled_avg_price'])
+                label = f'{pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P {pos["expiration"]}'
+                print(f'[reconcile] Pending close {pending_id[:8]}… confirmed filled — recording exit')
+                _log({'timestamp': now_str, 'event': 'PROFIT_TARGET_CLOSE_CONFIRMED_ON_RECONCILE',
+                      'label': label, 'order_id': pending_id, 'fill_cost': fill_cost})
+                _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET', fill_cost, now_str)
+                resolved_pending.append(pos)
+        for pos in resolved_pending:
+            try:
+                pos_state['positions'].remove(pos)
+            except ValueError:
+                pass
+        if resolved_pending:
+            _save_positions(pos_state)
+            _save_weekly(weekly)
+
         expected_legs = len(pos_state.get('positions', [])) * 2
         actual_legs   = len(option_legs)
 
