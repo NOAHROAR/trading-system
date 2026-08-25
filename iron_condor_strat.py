@@ -64,7 +64,7 @@ except ImportError:
 load_dotenv()
 
 # ── ACTIVATION FLAG ────────────────────────────────────────────────────────────
-ACTIVE = False   # Set to True to enable live order placement. Dormant by default.
+ACTIVE = True   # Set to True to enable live order placement. Dormant by default.
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK = os.getenv('DISCORD_WEBHOOK_URL')
