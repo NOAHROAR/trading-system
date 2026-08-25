@@ -268,6 +268,18 @@ def _init_db():
             except Exception as me:
                 print(f'[db] JSON weekly migration failed: {me}')
 
+        # Ensure row id=1 always exists so _db_load_weekly()'s SELECT can tell
+        # "no row yet" apart from "connection failed" — without this, a fresh
+        # table with zero rows makes _db_load_weekly() return None either way,
+        # silently falling back to ephemeral JSON until a week rollover or a
+        # trade close happens to call _db_save_weekly() for the first time.
+        cur.execute("""
+            INSERT INTO credit_spread_state (id, weekly_realized_loss, cooldown_active, week_start_date)
+            VALUES (1, 0.0, FALSE, %s)
+            ON CONFLICT (id) DO NOTHING
+        """, (_this_monday(),))
+        conn.commit()
+
     except Exception as e:
         print(f'[db] _init_db failed: {e}')
 
