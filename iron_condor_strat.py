@@ -623,24 +623,72 @@ def _log_trade(entry):
 
 
 # ── POSITIONS / WEEKLY STATE ────────────────────────────────────────────────────
+#
+# '_degraded' marker (2026-08-26 fix — mirrors the real data-loss incident
+# root-caused in credit_spread_strat.py): a Postgres outage can make
+# _load_positions() fall back to a LOCAL JSON file that's only ever updated
+# when a *write* fails — frozen at container-boot state (empty) the whole
+# time DB writes had been succeeding. _save_positions() is called
+# unconditionally from _send_morning_vitals / _check_daily_summary /
+# _attempt_entry regardless of whether the in-memory state was actually
+# complete. The moment Postgres recovers and one of those unconditional saves
+# fires, it would overwrite real Postgres rows with that stale/empty fallback
+# via the full DELETE+reinsert in _db_save_positions(). Fix: every pos_state
+# dict now carries a '_degraded' flag set by _load_positions() — True means
+# "this came from the JSON fallback because a DB read that should have
+# succeeded didn't" — and _save_positions() refuses to persist anything (DB
+# or JSON) while that flag is set, alerting instead of silently destroying
+# data.
+
+_db_degraded_alert_sent = False   # dedup: alert once per outage, not every scan
+
+
+def _alert_db_degraded(context):
+    global _db_degraded_alert_sent
+    if _db_degraded_alert_sent:
+        return
+    _db_degraded_alert_sent = True
+    msg = (f'🚨 DATABASE READ FAILED ({context}) — operating in degraded mode. '
+           f'Falling back to local JSON, which may be stale. All saves are now '
+           f'BLOCKED until Postgres recovers, to avoid overwriting real data with '
+           f'a stale fallback. Investigate DATABASE_URL / Postgres health now.')
+    print(f'  [db] {msg}')
+    _discord(msg)
+
 
 def _load_positions():
+    global _db_degraded_alert_sent
     if DATABASE_URL:
         result = _db_load_positions()
         if result is not None:
+            _db_degraded_alert_sent = False   # DB healthy again — re-arm the alert
+            result['_degraded'] = False
             return result
-        print('[db] _load_positions: DB unavailable, falling back to JSON')
+        print('[db] _load_positions: DB read failed, falling back to JSON — '
+              'saves will be blocked until DB recovers')
+        _alert_db_degraded('positions')
     try:
         with open(POSITIONS_FILE) as f:
             d = json.load(f)
         if isinstance(d, dict) and 'positions' in d:
+            d['_degraded'] = bool(DATABASE_URL)
             return d
     except Exception:
         pass
-    return {'positions': [], 'daily_summary_sent': None}
+    return {'positions': [], 'daily_summary_sent': None, '_degraded': bool(DATABASE_URL)}
 
 
 def _save_positions(ps):
+    if ps.get('_degraded'):
+        msg = ('🚨 REFUSING TO SAVE positions — state was loaded from the degraded/'
+               'stale-JSON fallback (Postgres read failed), not from Postgres itself. '
+               'Writing it now would overwrite real data. Not saving to DB or JSON; '
+               'will retry once a healthy DB read repopulates the in-memory state.')
+        print(f'  [save_positions] {msg}')
+        _log({'timestamp': datetime.now(ET).strftime('%Y-%m-%d %H:%M ET'),
+              'event': 'SAVE_REFUSED_DEGRADED_STATE'})
+        _discord(msg)
+        return
     if DATABASE_URL:
         if _db_save_positions(ps):
             return
@@ -666,22 +714,40 @@ def _empty_weekly():
 
 
 def _load_weekly():
+    global _db_degraded_alert_sent
     if DATABASE_URL:
         result = _db_load_weekly()
         if result is not None:
+            _db_degraded_alert_sent = False   # DB healthy again — re-arm the alert
+            result['_degraded'] = False
             return result
-        print('[db] _load_weekly: DB unavailable, falling back to JSON')
+        print('[db] _load_weekly: DB read failed, falling back to JSON — '
+              'saves will be blocked until DB recovers')
+        _alert_db_degraded('weekly')
     try:
         with open(WEEKLY_FILE) as f:
             d = json.load(f)
         if isinstance(d, dict) and 'week_start_date' in d:
+            d['_degraded'] = bool(DATABASE_URL)
             return d
     except Exception:
         pass
-    return _empty_weekly()
+    empty = _empty_weekly()
+    empty['_degraded'] = bool(DATABASE_URL)
+    return empty
 
 
 def _save_weekly(w):
+    if w.get('_degraded'):
+        msg = ('🚨 REFUSING TO SAVE weekly state — state was loaded from the degraded/'
+               'stale-JSON fallback (Postgres read failed), not from Postgres itself. '
+               'Writing it now would overwrite real data. Not saving to DB or JSON; '
+               'will retry once a healthy DB read repopulates the in-memory state.')
+        print(f'  [save_weekly] {msg}')
+        _log({'timestamp': datetime.now(ET).strftime('%Y-%m-%d %H:%M ET'),
+              'event': 'SAVE_REFUSED_DEGRADED_STATE'})
+        _discord(msg)
+        return
     if DATABASE_URL:
         if _db_save_weekly(w):
             return
@@ -697,7 +763,14 @@ def _reset_weekly_if_needed(w):
     monday = _this_monday()
     if w.get('week_start_date') != monday:
         print(f'  [weekly reset] New week {monday} — loss and cooldown cleared')
+        # _empty_weekly() builds a fresh dict with no '_degraded' key at all, which
+        # would read as falsy and bypass the refuse-to-save check in _save_weekly()
+        # below — so a stale, degraded fallback whose old week_start_date looks
+        # "expired" would otherwise sail straight past the guard and overwrite
+        # real Postgres state with zeros. Carry the flag through explicitly.
+        degraded = w.get('_degraded', False)
         w = _empty_weekly()
+        w['_degraded'] = degraded
         _save_weekly(w)
     return w
 
