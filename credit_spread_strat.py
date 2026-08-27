@@ -1913,16 +1913,40 @@ def _macro_event_today():
 
 # ── ENTRY CONDITIONS ───────────────────────────────────────────────────────────
 
+_entry_blocked_alert_sent = False   # dedup: alert once per outage, not every scan
+
+
 def _check_entry_conditions(ticker, pos_state, weekly):
     """
     Evaluate all gates cheapest-first. Short-circuits on first group failure.
     Returns (all_passed: bool, conditions: dict, stock_px, ivr, vix).
     """
+    global _entry_blocked_alert_sent
     conds    = {}
     stock_px = ivr = vix = None
 
     def _c(name, passed, detail):
         conds[name] = {'passed': bool(passed), 'detail': str(detail)}
+
+    # Hard guard: never evaluate or pass ANY gate on state loaded via the
+    # degraded fallback path (see _load_positions()/_load_weekly()). The
+    # 2026-08-26 fix stops a DB outage from corrupting saved state, but that
+    # alone doesn't stop the bot from placing a real order while it can't
+    # trust its own picture of open positions or cooldown status — this
+    # closes that entry-side gap.
+    if pos_state.get('_degraded') or weekly.get('_degraded'):
+        _c('degraded_state', False,
+           'pos_state or weekly loaded from degraded fallback — refusing to trade')
+        if not _entry_blocked_alert_sent:
+            _entry_blocked_alert_sent = True
+            msg = ('🚨 ENTRY BLOCKED — degraded DB state, refusing to trade on '
+                   'unreliable position/cooldown data.')
+            print(f'  [entry] {msg}')
+            _log({'timestamp': datetime.now(ET).strftime('%Y-%m-%d %H:%M ET'),
+                  'event': 'ENTRY_BLOCKED_DEGRADED_STATE'})
+            _discord(msg)
+        return False, conds, stock_px, ivr, vix
+    _entry_blocked_alert_sent = False   # state is healthy — re-arm for next time
 
     # Macro event gate — day-wide block, no API call
     macro = _macro_event_today()
