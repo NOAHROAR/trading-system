@@ -1064,7 +1064,7 @@ def _spy_ivrank():
         rs = _alpaca_get(
             f'{DATA_URL}/v1beta1/options/snapshots',
             headers=_data_headers(),
-            params={'symbols': sym, 'feed': 'indicative'}
+            params={'symbols': sym}   # feed omitted — Alpaca defaults to opra if subscribed, else indicative
         )
         if rs is None:
             raise ValueError('Snapshot endpoint unavailable')
@@ -1195,7 +1195,7 @@ def _fetch_options_chain_side(ticker, expiry, opt_type, now_str):
                 rs = _alpaca_get(
                     f'{DATA_URL}/v1beta1/options/snapshots',
                     headers=_data_headers(),
-                    params={'symbols': ','.join(batch), 'feed': 'indicative'},
+                    params={'symbols': ','.join(batch)},   # feed omitted — Alpaca defaults to opra if subscribed, else indicative
                     timeout=15,
                 )
                 if rs is None:
@@ -1427,7 +1427,7 @@ def _current_cost_to_close(short_sym, long_sym):
             rs = _alpaca_get(
                 f'{DATA_URL}/v1beta1/options/snapshots',
                 headers=_data_headers(),
-                params={'symbols': f'{short_sym},{long_sym}', 'feed': 'indicative'},
+                params={'symbols': f'{short_sym},{long_sym}'},   # feed omitted — Alpaca defaults to opra if subscribed, else indicative
             )
             if rs is not None:
                 break
