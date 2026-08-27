@@ -233,15 +233,32 @@ def _init_db():
                 morning_vitals_sent  TEXT
             )
         """)
-        # Safe migration: add column if an older schema exists
+        # Safe migration: add column if an older schema exists. Check via
+        # information_schema first so a routine boot never requests the ACCESS
+        # EXCLUSIVE lock ALTER TABLE needs once the column is already there —
+        # this exact unconditional ALTER TABLE queued behind another session's
+        # long-idle read transaction and stalled a container boot for 40+
+        # minutes on 2026-08-26 (see the conn.rollback() additions in the
+        # _db_load_*/_other_strategy_leg_symbols functions below for the
+        # transaction-leak side of that same incident).
         cur.execute("""
-            ALTER TABLE credit_spread_state
-            ADD COLUMN IF NOT EXISTS morning_vitals_sent TEXT
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'credit_spread_state' AND column_name = 'morning_vitals_sent'
         """)
+        if cur.fetchone() is None:
+            cur.execute("""
+                ALTER TABLE credit_spread_state
+                ADD COLUMN IF NOT EXISTS morning_vitals_sent TEXT
+            """)
         cur.execute("""
-            ALTER TABLE credit_spread_positions
-            ADD COLUMN IF NOT EXISTS pending_close_order_id TEXT
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'credit_spread_positions' AND column_name = 'pending_close_order_id'
         """)
+        if cur.fetchone() is None:
+            cur.execute("""
+                ALTER TABLE credit_spread_positions
+                ADD COLUMN IF NOT EXISTS pending_close_order_id TEXT
+            """)
         conn.commit()
         print('[db] Connected to PostgreSQL — persistent storage active')
 
@@ -329,6 +346,7 @@ def _db_load_positions():
             FROM credit_spread_state WHERE id = 1
         """)
         row = cur.fetchone()
+        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
         return {
             'positions':           positions,
             'daily_summary_sent':  row[0] if row else None,
@@ -402,6 +420,7 @@ def _db_read_summary_flags():
             'FROM credit_spread_state WHERE id = 1'
         )
         row = cur.fetchone()
+        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
         return (row[0], row[1]) if row else (None, None)
     except Exception as e:
         print(f'[db] _db_read_summary_flags failed: {e}')
@@ -451,6 +470,7 @@ def _db_load_weekly():
             FROM credit_spread_state WHERE id = 1
         """)
         row = cur.fetchone()
+        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
         if not row:
             return None
         return {
@@ -516,6 +536,7 @@ def _other_strategy_leg_symbols():
         cur = conn.cursor()
         cur.execute("SELECT to_regclass('public.iron_condor_positions')")
         if cur.fetchone()[0] is None:
+            conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
             return set()   # table doesn't exist yet — condor strategy never booted
         cur.execute("""
             SELECT short_put_symbol, long_put_symbol, short_call_symbol, long_call_symbol
@@ -526,6 +547,7 @@ def _other_strategy_leg_symbols():
             for sym in row:
                 if sym:
                     symbols.add(sym)
+        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
         return symbols
     except Exception as e:
         print(f'[db] _other_strategy_leg_symbols failed: {e}')

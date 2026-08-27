@@ -346,6 +346,7 @@ def _db_load_positions():
             FROM iron_condor_state WHERE id = 1
         """)
         row = cur.fetchone()
+        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
         return {
             'positions':           positions,
             'daily_summary_sent':  row[0] if row else None,
@@ -409,6 +410,7 @@ def _db_read_summary_flags():
             'FROM iron_condor_state WHERE id = 1'
         )
         row = cur.fetchone()
+        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
         return (row[0], row[1]) if row else (None, None)
     except Exception as e:
         print(f'[db] _db_read_summary_flags failed: {e}')
@@ -454,6 +456,7 @@ def _db_load_weekly():
             FROM iron_condor_state WHERE id = 1
         """)
         row = cur.fetchone()
+        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
         if not row:
             return None
         return {
@@ -521,6 +524,7 @@ def _other_strategy_leg_symbols():
             SELECT to_regclass('public.credit_spread_positions')
         """)
         if cur.fetchone()[0] is None:
+            conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
             return set()   # table doesn't exist yet — sibling strategy never booted
         cur.execute('SELECT short_symbol, long_symbol FROM credit_spread_positions')
         symbols = set()
@@ -529,6 +533,7 @@ def _other_strategy_leg_symbols():
                 symbols.add(short_sym)
             if long_sym:
                 symbols.add(long_sym)
+        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
         return symbols
     except Exception as e:
         print(f'[db] _other_strategy_leg_symbols failed: {e}')
