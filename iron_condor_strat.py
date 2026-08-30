@@ -211,7 +211,7 @@ def _get_db():
         return None
     try:
         if _DB is None or _DB.closed:
-            _DB = psycopg2.connect(DATABASE_URL)
+            _DB = psycopg2.connect(DATABASE_URL, connect_timeout=10)
         return _DB
     except Exception as e:
         print(f'[db] Connection failed: {e}')
