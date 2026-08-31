@@ -1619,6 +1619,24 @@ def _leg_close_costs_from_order(order, pos):
     return round(combined * put_credit / total, 4), round(combined * call_credit / total, 4)
 
 
+def _verify_close_fill(order_id, pos, quoted_put_cost, quoted_call_cost, label, now_str):
+    """After a market stop-loss close fills, pull real per-leg fills via
+    _leg_close_costs_from_order() instead of trusting the pre-order quoted costs —
+    same rationale as credit_spread_strat.py's _verify_close_fill. Falls back to the
+    quoted costs (with an explicit log entry) if the fill can't be confirmed in time."""
+    for _ in range(3):
+        order = _get_order(order_id)
+        if order and order.get('status') == 'filled':
+            return _leg_close_costs_from_order(order, pos)
+        time.sleep(2)
+    print(f'  {label}: could not verify market close fill — using quoted costs '
+          f'put ${quoted_put_cost:.4f} / call ${quoted_call_cost:.4f}')
+    _log({'timestamp': now_str, 'event': 'CLOSE_FILL_UNVERIFIED', 'label': label,
+          'order_id': order_id, 'quoted_put_cost': quoted_put_cost,
+          'quoted_call_cost': quoted_call_cost})
+    return quoted_put_cost, quoted_call_cost
+
+
 # ── ENTRY EXECUTION ────────────────────────────────────────────────────────────
 
 def _attempt_entry(pos_state, weekly, now_str, ticker,
@@ -1901,7 +1919,8 @@ def _monitor_positions(pos_state, weekly, now_str):
                     if ok:
                         pc = put_check if put_check is not None else pos['put_credit']
                         cc = call_check if call_check is not None else pos['call_credit']
-                        _record_exit(pos_state, weekly, pos, stop_reason, pc, cc, now_str)
+                        fill_put, fill_call = _verify_close_fill(ok, pos, pc, cc, label, now_str)
+                        _record_exit(pos_state, weekly, pos, stop_reason, fill_put, fill_call, now_str)
                         to_close.append(pos)
                     else:
                         _log({'timestamp': now_str, 'event': 'CLOSE_ORDER_FAILED',
@@ -1990,8 +2009,9 @@ def _monitor_positions(pos_state, weekly, now_str):
                     )
                     ok = _place_close_order(sp, lp, sc, lc, order_type='market')
                     if ok:
-                        _record_exit(pos_state, weekly, pos, stop_reason,
-                                     eff_put or 0.0, eff_call or 0.0, now_str)
+                        fill_put, fill_call = _verify_close_fill(
+                            ok, pos, eff_put or 0.0, eff_call or 0.0, label, now_str)
+                        _record_exit(pos_state, weekly, pos, stop_reason, fill_put, fill_call, now_str)
                         to_close.append(pos)
                     else:
                         _discord(
@@ -2037,7 +2057,8 @@ def _monitor_positions(pos_state, weekly, now_str):
                 print(f'  {label}: {stop_reason}')
                 ok = _place_close_order(sp, lp, sc, lc, order_type='market')
                 if ok:
-                    _record_exit(pos_state, weekly, pos, stop_reason, put_cost, call_cost, now_str)
+                    fill_put, fill_call = _verify_close_fill(ok, pos, put_cost, call_cost, label, now_str)
+                    _record_exit(pos_state, weekly, pos, stop_reason, fill_put, fill_call, now_str)
                     to_close.append(pos)
                 else:
                     print(f'  {label}: {stop_reason} close failed — retrying next cycle')

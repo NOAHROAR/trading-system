@@ -1493,6 +1493,25 @@ def _get_order(order_id):
         return None
 
 
+def _verify_close_fill(order_id, quoted_cost, label, now_str):
+    """After a market stop-loss close fills, pull the real filled_avg_price instead
+    of trusting the pre-order quoted cost — market orders can slip between the quote
+    that triggered the stop and the actual fill. Falls back to the quoted cost (with
+    an explicit log entry) if the fill can't be confirmed within a few seconds."""
+    for _ in range(3):
+        order = _get_order(order_id)
+        if order and order.get('status') == 'filled':
+            raw = order.get('filled_avg_price')
+            if raw is not None:
+                return abs(float(raw))
+            break
+        time.sleep(2)
+    print(f'  {label}: could not verify market close fill — using quoted cost ${quoted_cost:.4f}')
+    _log({'timestamp': now_str, 'event': 'CLOSE_FILL_UNVERIFIED',
+          'label': label, 'order_id': order_id, 'quoted_cost': quoted_cost})
+    return quoted_cost
+
+
 def _cancel_order(order_id):
     if not ACTIVE:
         return
@@ -1742,7 +1761,8 @@ def _monitor_positions(pos_state, weekly, now_str):
                     positions_updated = True
                     ok = _place_close_order(short_sym, long_sym, order_type='market')
                     if ok:
-                        _record_exit(pos_state, weekly, pos, 'STOP_LOSS', curr_cost_check, now_str)
+                        fill_cost = _verify_close_fill(ok, curr_cost_check, label, now_str)
+                        _record_exit(pos_state, weekly, pos, 'STOP_LOSS', fill_cost, now_str)
                         to_close.append(pos)
                     else:
                         _log({'timestamp': now_str, 'event': 'CLOSE_ORDER_FAILED',
@@ -1819,7 +1839,8 @@ def _monitor_positions(pos_state, weekly, now_str):
                     )
                     ok = _place_close_order(short_sym, long_sym, order_type='market')
                     if ok:
-                        _record_exit(pos_state, weekly, pos, 'STOP_LOSS', stale_cost, now_str)
+                        fill_cost = _verify_close_fill(ok, stale_cost, label, now_str)
+                        _record_exit(pos_state, weekly, pos, 'STOP_LOSS', fill_cost, now_str)
                         to_close.append(pos)
                     else:
                         _discord(
@@ -1860,7 +1881,8 @@ def _monitor_positions(pos_state, weekly, now_str):
                 print(f'  {label}: STOP LOSS')
                 ok = _place_close_order(short_sym, long_sym, order_type='market')
                 if ok:
-                    _record_exit(pos_state, weekly, pos, 'STOP_LOSS', cost, now_str)
+                    fill_cost = _verify_close_fill(ok, cost, label, now_str)
+                    _record_exit(pos_state, weekly, pos, 'STOP_LOSS', fill_cost, now_str)
                     to_close.append(pos)
                 else:
                     print(f'  {label}: stop-loss close failed — retrying next cycle')
