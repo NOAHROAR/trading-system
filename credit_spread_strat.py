@@ -2319,7 +2319,7 @@ def _send_morning_vitals():
     # Macro event
     macro = _macro_event_today()
     if macro:
-        macro_line = f'MACRO: {macro}  |  ⚠️ Blocked'
+        macro_line = f'MACRO: {macro}  |  ℹ️ Detected (filter disabled)'
     else:
         macro_line = 'MACRO: None scheduled  |  ✅ Clear'
 

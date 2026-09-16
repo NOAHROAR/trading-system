@@ -2308,7 +2308,7 @@ def _send_morning_vitals():
         ivr_line = 'IVR:  N/A'
 
     macro = _macro_event_today()
-    macro_line = (f'MACRO: {macro}  |  ⚠️ Blocked' if macro
+    macro_line = (f'MACRO: {macro}  |  ℹ️ Detected (filter disabled)' if macro
                   else 'MACRO: None scheduled  |  ✅ Clear')
 
     real_pos = [p for p in pos_state.get('positions', [])
