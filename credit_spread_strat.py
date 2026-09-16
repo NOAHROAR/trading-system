@@ -520,34 +520,44 @@ def _db_save_weekly(w):
 
 def _other_strategy_leg_symbols():
     """
-    Read iron_condor_strat.py's currently-tracked leg symbols directly from its
-    Postgres table. Both strategies share one Alpaca account and one
-    DATABASE_URL; without this, startup reconciliation and the daily-summary
-    Alpaca cross-check below would count the condor's real, legitimate legs as
-    "untracked" and fire false-positive mismatch alerts / add blocker
-    placeholders — added 2026-08-20 when iron_condor_strat.py started sharing
-    this account. Returns a set of symbols. Empty set (not None) on any
-    failure — a failed lookup should never itself trigger a false mismatch.
+    Read iron_condor_strat.py's and zero_dte_v2_strat.py's currently-tracked
+    leg symbols directly from their Postgres tables. All three strategies
+    share one Alpaca account and one DATABASE_URL; without this, startup
+    reconciliation and the daily-summary Alpaca cross-check below would count
+    a sibling strategy's real, legitimate legs as "untracked" and fire
+    false-positive mismatch alerts / add blocker placeholders — added
+    2026-08-20 when iron_condor_strat.py started sharing this account, and
+    extended 2026-09-15 when zero_dte_v2_strat.py joined it. Note that
+    zero_dte_v2_strat.py's own legs are already excluded here via the
+    `!= today_ymd` filter in _reconcile_on_startup() / _check_daily_summary()
+    below (any 0DTE-dated leg is never this strategy's, since this strategy
+    only ever holds 6-8 DTE positions) — querying its table here too is
+    belt-and-suspenders precision, not the primary defense. Returns a set of
+    symbols. Empty set (not None) on any failure — a failed lookup should
+    never itself trigger a false mismatch.
     """
     conn = _get_db()
     if conn is None:
         return set()
+    symbols = set()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT to_regclass('public.iron_condor_positions')")
-        if cur.fetchone()[0] is None:
+        for table, cols in (
+            ('iron_condor_positions', ('short_put_symbol', 'long_put_symbol',
+                                        'short_call_symbol', 'long_call_symbol')),
+            ('zero_dte_v2_positions', ('short_symbol', 'long_symbol')),
+        ):
+            cur.execute("SELECT to_regclass(%s)", (f'public.{table}',))
+            if cur.fetchone()[0] is None:
+                conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
+                continue   # sibling strategy never booted
+            col_list = ', '.join(cols)
+            cur.execute(f'SELECT {col_list} FROM {table}')
+            for row in cur.fetchall():
+                for sym in row:
+                    if sym:
+                        symbols.add(sym)
             conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
-            return set()   # table doesn't exist yet — condor strategy never booted
-        cur.execute("""
-            SELECT short_put_symbol, long_put_symbol, short_call_symbol, long_call_symbol
-            FROM iron_condor_positions
-        """)
-        symbols = set()
-        for row in cur.fetchall():
-            for sym in row:
-                if sym:
-                    symbols.add(sym)
-        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
         return symbols
     except Exception as e:
         print(f'[db] _other_strategy_leg_symbols failed: {e}')
@@ -843,7 +853,7 @@ def _reconcile_on_startup():
             p for p in r.json()
             if p.get('asset_class') == 'us_option'
             and any(str(p.get('symbol', '')).startswith(t) for t in TICKERS)
-            and str(p.get('symbol', ''))[3:9] != today_ymd   # ignore 0DTE legs (dte0_strat.py handles those)
+            and str(p.get('symbol', ''))[3:9] != today_ymd   # ignore 0DTE legs (zero_dte_v2_strat.py handles those)
             and p.get('symbol', '') not in other_legs        # ignore iron_condor_strat.py's legs
         ]
         # Resolve positions whose profit-target close order filled while the process was down.
@@ -1437,7 +1447,7 @@ def _place_open_order(short_sym, long_sym, credit):
             'type':          'limit',
             'time_in_force': 'day',
             'order_class':   'mleg',
-            'limit_price':   str(round(credit, 2)),
+            'limit_price':   str(round(-credit, 2)),   # negative = credit (Alpaca mleg convention)
             'legs': [
                 {'symbol': short_sym, 'side': 'sell',
                  'ratio_qty': '1', 'position_intent': 'sell_to_open'},
