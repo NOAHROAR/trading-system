@@ -2046,6 +2046,14 @@ def _check_entry_conditions(pos_state, weekly):
     _entry_blocked_alert_sent = False
 
     macro = _macro_event_today()
+    # ─── INTENTIONALLY DISABLED (2026-09-16) — paper-trading data collection ───
+    # Entry gate short-circuited to always pass; trades execute through
+    # FOMC/CPI/GDP/NFP days too. FOMC_DAYS/CPI_DAYS/GDP_DAYS and
+    # _macro_event_today() itself are UNCHANGED — this override is the only
+    # new code. RE-ENABLE BEFORE ANY REAL-MONEY DEPLOYMENT by deleting this
+    # marked block; the two original lines below resume their normal behavior.
+    macro = None
+    # ─── END INTENTIONALLY-DISABLED BLOCK ───
     _c('macro_event', macro is None, macro or 'none')
     if macro:
         return False, conds, spy_px, ivr, vix
