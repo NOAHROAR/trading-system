@@ -1,44 +1,83 @@
 #!/usr/bin/env python3
 """
-iron_condor_strat.py — 7DTE SPY Iron Condor Strategy (Mode A: combined stop).
+zero_dte_v2_strat.py — 0DTE SPY Put Credit Spread Strategy, V2 (more aggressive).
 
-STANDALONE: no imports from credit_spread_strat.py, scanner.py, or paper_execution.py.
-Runs ALONGSIDE credit_spread_strat.py as a second Railway worker — same Alpaca
-paper account, completely separate Postgres tables and state files.
+STANDALONE: no imports from credit_spread_strat.py, iron_condor_strat.py,
+archive/dte0_strat.py, scanner.py, or paper_execution.py.
 DORMANT until ACTIVE = True.
 
-Structure: sells a $5-wide put spread AND a $5-wide call spread, same expiration,
-both legs 20-delta. Backtest reference: backtests_strategies/backtest_iron_condor.py,
-Mode A (combined stop — the whole condor closes if EITHER leg hits 200% of its own
-credit, or the combined position hits 50% profit).
+Rebuilt from the archived archive/dte0_strat.py's 0DTE structure (entry window,
+same-day force close, intraday Black-Scholes timing) on top of the CURRENT
+hardened infrastructure patterns from credit_spread_strat.py / iron_condor_strat.py
+— NOT the archived file's data-handling code, which predates all of the fixes
+below:
+  - PostgreSQL is the primary store (zero_dte_v2_positions, zero_dte_v2_state).
+    Local JSON is only ever a degraded-mode fallback, never primary — see the
+    '_degraded' flag notes above _load_positions()/_load_weekly() below.
+  - Fill verification on BOTH open and close orders, for BOTH limit and market
+    order types — an "order submitted" response is never treated as "order
+    filled." Opens: poll until status == 'filled' and read filled_avg_price
+    directly. Profit-target closes (limit): tracked via pending_close_order_id
+    and confirmed filled on a later scan/reconcile, never recorded as closed
+    from the pre-order quote. Stop-loss / force closes (market): confirmed via
+    _verify_close_fill() reading the real filled_avg_price, not the quote that
+    triggered the order.
+  - Every state load carries a '_degraded' flag; _save_positions()/_save_weekly()
+    refuse to persist (DB or JSON) while it's set, and _check_entry_conditions()
+    refuses to trade on it — a stale/empty JSON fallback must never overwrite
+    real Postgres state or drive a live entry decision.
+  - conn.rollback() on every read-only DB function; connect_timeout=10 on the
+    DB connection.
+  - PYTHONUNBUFFERED is set at the Railway service level, not in code.
+  - Reconcile-on-startup excludes ALL THREE strategies' legs from each other.
+    credit_spread_strat.py and iron_condor_strat.py only ever hold 6-8 DTE
+    positions, so they can safely treat every option leg dated today as "not
+    mine" (see their `!= today_ymd` filters). This strategy's own legs ARE
+    dated today by definition, so it can't use that trick — a credit_spread or
+    iron_condor position opened ~7 days ago that happens to expire TODAY is
+    indistinguishable from one of this strategy's own legs by date alone. See
+    _other_strategy_leg_symbols() below for the expiration-filtered fix.
+    credit_spread_strat.py and iron_condor_strat.py were both patched
+    (2026-09-15) to also exclude this strategy's legs from their own
+    reconciliation.
+
+STRATEGY PARAMETERS — from the 2026-09-15 skew-corrected backtest
+(scratch variant of archive/backtest_0dte.py; see that session's results):
+  Short put      25-30 delta (vs. the archived 15-delta)
+  Spread width   $3.00 (vs. the archived $2.00)
+  Entry window   9:45-11:00am ET (unchanged)
+  Force close    3:45pm ET same day (unchanged)
+  Profit target  50% of credit (unchanged)
+  Stop loss      150% of credit (unchanged)
+  Max positions  2 (up from the archived 1 — "more volume" per this rebuild's brief)
+  Min credit     $0.25 — backtest observed min $0.28 / mean $0.379 across 393
+                 trades (2020-06 to 2026-07, skew-corrected); $0.25 sits below
+                 every observed trade as a genuine sanity floor, not a binding
+                 filter, following the same ~proportional-to-width convention
+                 as the other two strategies ($0.25 on 7DTE's $5-wide put leg;
+                 $0.10 on the archived 0DTE's $2-wide spread).
+  IVR threshold  20% (unchanged from the archived constant — confirmed against
+                 the backtest's own IVR filter). Methodology swapped from the
+                 backtest's VIX-percentile proxy to the same real ATM-IV,
+                 252-day-Parkinson-window methodology already live in
+                 credit_spread_strat.py / iron_condor_strat.py (_spy_ivrank()
+                 below) — identical substitution to how those two files already
+                 differ from their own backtests.
+  Max VIX        35% (unchanged)
+
+Weekly loss limit is isolated: own $1,000 limit, own zero_dte_v2_state row —
+no carryover from credit_spread_strat.py's or iron_condor_strat.py's tracking.
+
+Discord: same webhook as the other two strategies, every message prefixed
+[0DTE-V2] to distinguish from the retired [0DTE] naming (archive/dte0_strat.py)
+and from the other two strategies' own (unprefixed / [CONDOR]) messages.
 
 Alpaca API: raw requests only (no SDK; requirements.txt: requests==2.32.5).
-  POST /v2/orders  order_class='mleg'  4 legs in a single order (Alpaca's mleg
-  orders support up to 4 legs — confirmed via API reference, maxItems: 4).
-  IMPORTANT — limit_price sign convention on multi-leg orders (per Alpaca API
-  reference): positive = net DEBIT, negative = net CREDIT. Opening a condor is
-  a net credit, so the open order's limit_price must be NEGATIVE. Closing it
-  (buying it back) is a net debit, so the close order's limit_price is positive.
+  POST /v2/orders  order_class='mleg'  for multi-leg spread orders.
 
-State files (all independent of credit_spread_strat.py's and scanner.py's files):
-  iron_condor_positions.json — open positions + daily summary flag
-  iron_condor_state.json     — weekly_realized_loss, cooldown_active, week_start_date
-  iron_condor_trade_log.json — permanent trade history (never truncated)
-  iron_condor_log.json       — rolling 500-entry scan log
-
-Cross-strategy coexistence with credit_spread_strat.py:
-  Both strategies trade SPY options in the same Alpaca account. Startup
-  reconciliation and the daily-summary Alpaca cross-check both need to count
-  ONLY this strategy's own legs, so both sides read the other's Postgres table
-  (credit_spread_positions) directly to exclude its legs from this strategy's
-  "untracked leg" detection — see _reconcile_on_startup(). credit_spread_strat.py
-  was patched symmetrically to exclude iron_condor_positions' legs from its own
-  reconcile — without that, both strategies would immediately false-alarm on
-  each other's positions and block new entries.
-
-Deploy as a third Railway worker (separate service — do not add to the existing
-Procfile/railway.json; configure directly in the new service's settings):
-  Start command:  python3 iron_condor_strat.py
+Deploy as a fourth Railway worker (separate service — do not add to the
+existing Procfile/railway.json; configure directly in the new service):
+  Start command:  python3 zero_dte_v2_strat.py
 """
 
 import json
@@ -48,7 +87,6 @@ import time
 from datetime import date, datetime, timedelta
 
 import numpy as np
-import pandas as pd
 import pytz
 import requests
 import schedule
@@ -64,7 +102,7 @@ except ImportError:
 load_dotenv()
 
 # ── ACTIVATION FLAG ────────────────────────────────────────────────────────────
-ACTIVE = True   # Set to True to enable live order placement. Dormant by default.
+ACTIVE = False   # Dormant by default. Set to True to enable live order placement.
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK = os.getenv('DISCORD_WEBHOOK_URL')
@@ -76,31 +114,29 @@ DATABASE_URL    = os.getenv('DATABASE_URL')
 ET              = pytz.timezone('US/Eastern')
 _DIR            = os.path.dirname(os.path.abspath(__file__))
 
-DISCORD_PREFIX  = '[CONDOR] '
+DISCORD_PREFIX  = '[0DTE-V2] '
 
-# Strategy parameters — matches backtests_strategies/backtest_iron_condor.py Mode A
-TARGET_DTE        = 7
-DTE_MIN           = 6
-DTE_MAX           = 8
-TARGET_DELTA      = 0.20
-DELTA_TOLERANCE   = 0.05     # reject if no strike within 0.05 of target delta
-SPREAD_WIDTH      = 5.0
-MIN_CREDIT_LEG    = 0.25     # minimum credit per individual leg (put AND call)
-MAX_POSITIONS     = 2
-TICKERS           = ['SPY']
-PROFIT_TARGET_PCT = 0.50     # of COMBINED (put + call) credit
-STOP_LOSS_PCT     = 2.00     # of EACH leg's OWN credit, checked independently
-ORDER_FILL_TIMEOUT = 300
-WEEKLY_LOSS_LIMIT = 1_000.0  # isolated from credit_spread_strat.py's own weekly tracking
-RISK_FREE_RATE    = 0.045
-VIX_IVR_WINDOW    = 252
-MIN_IVR           = 30.0
-MAX_VIX           = 35.0
-SMA_PERIOD        = 20
+# Strategy parameters — see module docstring for backtest provenance
+TARGET_DELTA       = 0.275     # center of the 25-30 delta band
+DELTA_TOLERANCE    = 0.025     # accepts |delta| in [0.250, 0.300]
+SPREAD_WIDTH       = 3.0
+MIN_CREDIT         = 0.25
+MAX_POSITIONS      = 2
+TICKERS            = ['SPY']
+PROFIT_TARGET_PCT  = 0.50
+STOP_LOSS_PCT      = 1.50
+ORDER_FILL_TIMEOUT = 120       # shorter than 7DTE's 300s — 0DTE moves fast
+WEEKLY_LOSS_LIMIT  = 1_000.0   # isolated from the other two strategies
+RISK_FREE_RATE     = 0.045
+VIX_IVR_WINDOW     = 252
+MIN_IVR            = 20.0
+MAX_VIX            = 35.0
+SMA_PERIOD         = 20
 
 # ── MACRO EVENT CALENDAR ───────────────────────────────────────────────────────
-# Identical to credit_spread_strat.py's calendar — kept in sync manually since
-# both files are standalone (no shared imports). Update each January using:
+# Identical to credit_spread_strat.py's / iron_condor_strat.py's calendars — kept
+# in sync manually since all three files are standalone (no shared imports).
+# Update each January using official sources:
 #   FOMC: federalreserve.gov/monetarypolicy/fomccalendars.htm
 #   CPI:  bls.gov/schedule/news_release/cpi.htm
 #   GDP:  bea.gov/news/schedule
@@ -133,16 +169,19 @@ GDP_DAYS = {
     '2026-10-29',   # Q3 2026
 }
 
-# Timing — same cadence as credit_spread_strat.py
-ENTRY_HOUR_START, ENTRY_MIN_START =  9, 45
-ENTRY_HOUR_END,   ENTRY_MIN_END   = 15, 30
-SUMMARY_HOUR,     SUMMARY_MIN     = 15, 35
+# Timing (ET)
+ENTRY_HOUR_START, ENTRY_MIN_START  =  9, 45
+ENTRY_HOUR_END,   ENTRY_MIN_END    = 11,  0
+FORCE_CLOSE_HOUR, FORCE_CLOSE_MIN  = 15, 45
+SUMMARY_HOUR,     SUMMARY_MIN      = 15, 50
+VITALS_HOUR,      VITALS_MIN_START =  9, 30
+VITALS_MIN_END                     = 34
 
-# Files
-POSITIONS_FILE = os.path.join(_DIR, 'iron_condor_positions.json')
-WEEKLY_FILE    = os.path.join(_DIR, 'iron_condor_state.json')
-TRADE_LOG_FILE = os.path.join(_DIR, 'iron_condor_trade_log.json')
-SCAN_LOG_FILE  = os.path.join(_DIR, 'iron_condor_log.json')
+# Files — JSON is a degraded-mode fallback only, never the primary store
+POSITIONS_FILE = os.path.join(_DIR, 'zero_dte_v2_positions.json')
+WEEKLY_FILE    = os.path.join(_DIR, 'zero_dte_v2_state.json')
+TRADE_LOG_FILE = os.path.join(_DIR, 'zero_dte_v2_trade_log.json')
+SCAN_LOG_FILE  = os.path.join(_DIR, 'zero_dte_v2_log.json')
 LOG_MAX        = 500
 
 
@@ -189,10 +228,8 @@ _last_scan_start:    datetime = None
 _last_scan_duration: float    = 0.0
 
 # ── MONITOR RELIABILITY STATE ──────────────────────────────────────────────────
-# Keyed generically by a tuple of the 4 leg symbols — works the same way as
-# credit_spread_strat.py's 2-symbol key, just longer.
-_last_known_cost:     dict = {}  # leg_key → {'put_cost': float, 'call_cost': float, 'ts': datetime}
-_monitor_consec_fail: dict = {}  # leg_key → consecutive failure count
+_last_known_cost:     dict = {}
+_monitor_consec_fail: dict = {}
 _monitor_alert_sent:  set  = set()
 
 STALE_COST_MAX_MINUTES  = 30
@@ -201,7 +238,7 @@ MONITOR_ALERT_THRESHOLD = 3
 
 # ── DATABASE ───────────────────────────────────────────────────────────────────
 
-_DB = None  # module-level psycopg2 connection
+_DB = None
 
 
 def _get_db():
@@ -228,38 +265,29 @@ def _init_db():
     try:
         cur = conn.cursor()
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS iron_condor_positions (
-                id                      SERIAL PRIMARY KEY,
-                short_put_symbol        TEXT NOT NULL,
-                long_put_symbol         TEXT NOT NULL,
-                short_call_symbol       TEXT NOT NULL,
-                long_call_symbol        TEXT NOT NULL,
-                short_put_strike        DOUBLE PRECISION,
-                long_put_strike         DOUBLE PRECISION,
-                short_call_strike       DOUBLE PRECISION,
-                long_call_strike        DOUBLE PRECISION,
-                expiration              TEXT,
-                put_credit              DOUBLE PRECISION,
-                call_credit             DOUBLE PRECISION,
-                total_credit            DOUBLE PRECISION,
-                max_risk                DOUBLE PRECISION,
-                put_breakeven           DOUBLE PRECISION,
-                call_breakeven          DOUBLE PRECISION,
-                profit_target           DOUBLE PRECISION,
-                put_stop_cost           DOUBLE PRECISION,
-                call_stop_cost          DOUBLE PRECISION,
-                open_time               TEXT,
-                entry_order_id          TEXT,
-                short_put_delta         DOUBLE PRECISION,
-                short_call_delta        DOUBLE PRECISION,
-                spy_entry_px            DOUBLE PRECISION,
-                reconciled              BOOLEAN DEFAULT FALSE,
-                note                    TEXT,
-                pending_close_order_id  TEXT
+            CREATE TABLE IF NOT EXISTS zero_dte_v2_positions (
+                id                     SERIAL PRIMARY KEY,
+                short_symbol           TEXT NOT NULL,
+                long_symbol            TEXT NOT NULL,
+                short_strike           DOUBLE PRECISION,
+                long_strike            DOUBLE PRECISION,
+                expiration             TEXT,
+                credit                 DOUBLE PRECISION,
+                max_risk               DOUBLE PRECISION,
+                breakeven              DOUBLE PRECISION,
+                profit_target          DOUBLE PRECISION,
+                stop_loss_cost         DOUBLE PRECISION,
+                open_time              TEXT,
+                entry_order_id         TEXT,
+                short_delta            DOUBLE PRECISION,
+                spy_entry_px           DOUBLE PRECISION,
+                reconciled             BOOLEAN DEFAULT FALSE,
+                note                   TEXT,
+                pending_close_order_id TEXT
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS iron_condor_state (
+            CREATE TABLE IF NOT EXISTS zero_dte_v2_state (
                 id                   INTEGER PRIMARY KEY DEFAULT 1,
                 weekly_realized_loss DOUBLE PRECISION DEFAULT 0.0,
                 cooldown_active      BOOLEAN DEFAULT FALSE,
@@ -272,7 +300,7 @@ def _init_db():
         print('[db] Connected to PostgreSQL — persistent storage active')
 
         # One-time migration: seed from JSON files if tables are empty on first boot
-        cur.execute('SELECT COUNT(*) FROM iron_condor_positions')
+        cur.execute('SELECT COUNT(*) FROM zero_dte_v2_positions')
         if cur.fetchone()[0] == 0 and os.path.exists(POSITIONS_FILE):
             try:
                 with open(POSITIONS_FILE) as f:
@@ -283,7 +311,7 @@ def _init_db():
             except Exception as me:
                 print(f'[db] JSON positions migration failed: {me}')
 
-        cur.execute('SELECT COUNT(*) FROM iron_condor_state')
+        cur.execute('SELECT COUNT(*) FROM zero_dte_v2_state')
         if cur.fetchone()[0] == 0 and os.path.exists(WEEKLY_FILE):
             try:
                 with open(WEEKLY_FILE) as f:
@@ -295,12 +323,10 @@ def _init_db():
                 print(f'[db] JSON weekly migration failed: {me}')
 
         # Ensure row id=1 always exists so _db_load_weekly()'s SELECT can tell
-        # "no row yet" apart from "connection failed" — without this, a fresh
-        # table with zero rows makes _db_load_weekly() return None either way,
-        # silently falling back to ephemeral JSON until a week rollover or a
-        # trade close happens to call _db_save_weekly() for the first time.
+        # "no row yet" apart from "connection failed" — same reasoning as
+        # credit_spread_strat.py's identical guard.
         cur.execute("""
-            INSERT INTO iron_condor_state (id, weekly_realized_loss, cooldown_active, week_start_date)
+            INSERT INTO zero_dte_v2_state (id, weekly_realized_loss, cooldown_active, week_start_date)
             VALUES (1, 0.0, FALSE, %s)
             ON CONFLICT (id) DO NOTHING
         """, (_this_monday(),))
@@ -308,15 +334,10 @@ def _init_db():
 
     except Exception as e:
         print(f'[db] _init_db failed: {e}')
-
-
-_POSITION_COLUMNS = (
-    'short_put_symbol', 'long_put_symbol', 'short_call_symbol', 'long_call_symbol',
-    'short_put_strike', 'long_put_strike', 'short_call_strike', 'long_call_strike',
-    'expiration', 'put_credit', 'call_credit', 'total_credit', 'max_risk',
-    'put_breakeven', 'call_breakeven', 'profit_target', 'put_stop_cost', 'call_stop_cost',
-    'open_time', 'entry_order_id', 'short_put_delta', 'short_call_delta', 'spy_entry_px',
-)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
 
 def _db_load_positions():
@@ -326,27 +347,45 @@ def _db_load_positions():
         return None
     try:
         cur = conn.cursor()
-        cur.execute(f"""
-            SELECT {', '.join(_POSITION_COLUMNS)}, reconciled, note, pending_close_order_id
-            FROM iron_condor_positions ORDER BY id
+        cur.execute("""
+            SELECT short_symbol, long_symbol, short_strike, long_strike,
+                   expiration, credit, max_risk, breakeven, profit_target,
+                   stop_loss_cost, open_time, entry_order_id, short_delta,
+                   spy_entry_px, reconciled, note, pending_close_order_id
+            FROM zero_dte_v2_positions ORDER BY id
         """)
         positions = []
         for row in cur.fetchall():
-            pos = dict(zip(_POSITION_COLUMNS, row[:len(_POSITION_COLUMNS)]))
-            if row[len(_POSITION_COLUMNS)]:
+            pos = {
+                'short_symbol':   row[0],
+                'long_symbol':    row[1],
+                'short_strike':   row[2],
+                'long_strike':    row[3],
+                'expiration':     row[4],
+                'credit':         row[5],
+                'max_risk':       row[6],
+                'breakeven':      row[7],
+                'profit_target':  row[8],
+                'stop_loss_cost': row[9],
+                'open_time':      row[10],
+                'entry_order_id': row[11],
+                'short_delta':    row[12],
+                'spy_entry_px':   row[13],
+            }
+            if row[14]:
                 pos['reconciled'] = True
-            if row[len(_POSITION_COLUMNS) + 1]:
-                pos['note'] = row[len(_POSITION_COLUMNS) + 1]
-            if row[len(_POSITION_COLUMNS) + 2]:
-                pos['pending_close_order_id'] = row[len(_POSITION_COLUMNS) + 2]
+            if row[15]:
+                pos['note'] = row[15]
+            if row[16]:
+                pos['pending_close_order_id'] = row[16]
             positions.append(pos)
 
         cur.execute("""
             SELECT daily_summary_sent, morning_vitals_sent
-            FROM iron_condor_state WHERE id = 1
+            FROM zero_dte_v2_state WHERE id = 1
         """)
         row = cur.fetchone()
-        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
+        conn.rollback()   # close out this read-only transaction
         return {
             'positions':           positions,
             'daily_summary_sent':  row[0] if row else None,
@@ -360,27 +399,35 @@ def _db_load_positions():
 
 
 def _db_save_positions(ps):
-    """Replace all rows in iron_condor_positions and update daily_summary_sent."""
+    """Replace all rows in zero_dte_v2_positions and update daily_summary_sent."""
     conn = _get_db()
     if conn is None:
         return False
     try:
         cur = conn.cursor()
-        cur.execute('DELETE FROM iron_condor_positions')
-        cols = _POSITION_COLUMNS + ('reconciled', 'note', 'pending_close_order_id')
-        placeholders = ','.join(['%s'] * len(cols))
+        cur.execute('DELETE FROM zero_dte_v2_positions')
         for pos in ps.get('positions', []):
-            values = tuple(pos.get(c) for c in _POSITION_COLUMNS) + (
+            cur.execute("""
+                INSERT INTO zero_dte_v2_positions (
+                    short_symbol, long_symbol, short_strike, long_strike,
+                    expiration, credit, max_risk, breakeven, profit_target,
+                    stop_loss_cost, open_time, entry_order_id, short_delta,
+                    spy_entry_px, reconciled, note, pending_close_order_id
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                pos.get('short_symbol'),    pos.get('long_symbol'),
+                pos.get('short_strike'),    pos.get('long_strike'),
+                pos.get('expiration'),      pos.get('credit'),
+                pos.get('max_risk'),        pos.get('breakeven'),
+                pos.get('profit_target'),   pos.get('stop_loss_cost'),
+                pos.get('open_time'),       pos.get('entry_order_id'),
+                pos.get('short_delta'),     pos.get('spy_entry_px'),
                 bool(pos.get('reconciled', False)),
                 pos.get('note'),
                 pos.get('pending_close_order_id'),
-            )
-            cur.execute(
-                f"INSERT INTO iron_condor_positions ({', '.join(cols)}) VALUES ({placeholders})",
-                values,
-            )
+            ))
         cur.execute("""
-            INSERT INTO iron_condor_state (id, daily_summary_sent, morning_vitals_sent)
+            INSERT INTO zero_dte_v2_state (id, daily_summary_sent, morning_vitals_sent)
             VALUES (1, %s, %s)
             ON CONFLICT (id) DO UPDATE SET
                 daily_summary_sent  = EXCLUDED.daily_summary_sent,
@@ -400,6 +447,8 @@ def _db_save_positions(ps):
 
 
 def _db_read_summary_flags():
+    """Return (daily_summary_sent, morning_vitals_sent) directly from DB state row.
+    Returns (None, None) on DB failure or missing row."""
     conn = _get_db()
     if conn is None:
         return None, None
@@ -407,10 +456,10 @@ def _db_read_summary_flags():
         cur = conn.cursor()
         cur.execute(
             'SELECT daily_summary_sent, morning_vitals_sent '
-            'FROM iron_condor_state WHERE id = 1'
+            'FROM zero_dte_v2_state WHERE id = 1'
         )
         row = cur.fetchone()
-        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
+        conn.rollback()   # close out this read-only transaction
         return (row[0], row[1]) if row else (None, None)
     except Exception as e:
         print(f'[db] _db_read_summary_flags failed: {e}')
@@ -418,6 +467,7 @@ def _db_read_summary_flags():
 
 
 def _db_write_summary_flags(daily_str, vitals_str):
+    """Update only the two summary-flag columns in zero_dte_v2_state."""
     conn = _get_db()
     if conn is None:
         return False
@@ -425,7 +475,7 @@ def _db_write_summary_flags(daily_str, vitals_str):
         cur = conn.cursor()
         cur.execute(
             """
-            UPDATE iron_condor_state
+            UPDATE zero_dte_v2_state
                SET daily_summary_sent  = %s,
                    morning_vitals_sent = %s
              WHERE id = 1
@@ -446,6 +496,7 @@ def _db_write_summary_flags(daily_str, vitals_str):
 
 
 def _db_load_weekly():
+    """Load weekly state from PostgreSQL. Returns None on failure or no row."""
     conn = _get_db()
     if conn is None:
         return None
@@ -453,10 +504,10 @@ def _db_load_weekly():
         cur = conn.cursor()
         cur.execute("""
             SELECT weekly_realized_loss, cooldown_active, week_start_date
-            FROM iron_condor_state WHERE id = 1
+            FROM zero_dte_v2_state WHERE id = 1
         """)
         row = cur.fetchone()
-        conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
+        conn.rollback()   # close out this read-only transaction
         if not row:
             return None
         return {
@@ -472,13 +523,14 @@ def _db_load_weekly():
 
 
 def _db_save_weekly(w):
+    """Upsert weekly state in PostgreSQL."""
     conn = _get_db()
     if conn is None:
         return False
     try:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO iron_condor_state
+            INSERT INTO zero_dte_v2_state
                 (id, weekly_realized_loss, cooldown_active, week_start_date)
             VALUES (1, %s, %s, %s)
             ON CONFLICT (id) DO UPDATE SET
@@ -505,52 +557,58 @@ def _db_save_weekly(w):
 
 def _other_strategy_leg_symbols():
     """
-    Read credit_spread_strat.py's and zero_dte_v2_strat.py's currently-tracked
-    leg symbols directly from their Postgres tables. All three strategies
-    share one Alpaca account and one DATABASE_URL; without this, each
-    strategy's startup reconciliation and daily-summary Alpaca cross-check
-    would count a sibling strategy's real, legitimate option legs as
-    "untracked" and fire false-positive mismatch alerts / add blocker
-    placeholders — exactly the false-positive-mismatch bug class
-    credit_spread_strat.py's own reconcile fix (2026-08-16) was built to
-    eliminate, just from a different cause. Extended 2026-09-15 when
-    zero_dte_v2_strat.py joined this account. Note that zero_dte_v2_strat.py's
-    own legs are already excluded here via the `!= today_ymd` filter in
-    _reconcile_on_startup() below (any 0DTE-dated leg is never this
-    strategy's, since this strategy only ever holds 6-8 DTE positions) —
-    querying its table here too is belt-and-suspenders precision, not the
-    primary defense. Returns a set of symbols. Empty set (not None) on any
-    failure — a failed lookup should never itself trigger a false mismatch
-    alert.
+    Read credit_spread_strat.py's and iron_condor_strat.py's currently-tracked
+    leg symbols directly from their Postgres tables, restricted to positions
+    EXPIRING TODAY.
+
+    This is deliberately different from credit_spread_strat.py's and
+    iron_condor_strat.py's own _other_strategy_leg_symbols(): those two only
+    ever hold 6-8 DTE positions, so they can cheaply and safely exclude every
+    option leg dated today from their own reconciliation (a today-dated leg
+    can never be theirs — see their `!= today_ymd` filters). This strategy's
+    own legs ARE dated today by definition, so that trick doesn't work here:
+    a credit_spread or iron_condor position opened ~7 days ago that happens to
+    expire TODAY produces an OCC symbol indistinguishable, by date alone, from
+    one of this strategy's own legs. Without filtering those out explicitly,
+    this strategy's startup reconciliation and daily-summary Alpaca cross-check
+    would double-count a sibling strategy's expiring position as an
+    "untracked" 0DTE leg and block new entries.
+
+    Returns a set of symbols. Empty set (not None) on any failure — a failed
+    lookup should never itself trigger a false mismatch.
     """
     conn = _get_db()
     if conn is None:
         return set()
+    today_str = datetime.now(ET).date().isoformat()
     symbols = set()
     try:
         cur = conn.cursor()
         for table, cols in (
             ('credit_spread_positions', ('short_symbol', 'long_symbol')),
-            ('zero_dte_v2_positions',   ('short_symbol', 'long_symbol')),
+            ('iron_condor_positions',   ('short_put_symbol', 'long_put_symbol',
+                                          'short_call_symbol', 'long_call_symbol')),
         ):
             cur.execute("SELECT to_regclass(%s)", (f'public.{table}',))
             if cur.fetchone()[0] is None:
-                conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
+                conn.rollback()   # close out this read-only transaction
                 continue   # sibling strategy never booted
             col_list = ', '.join(cols)
-            cur.execute(f'SELECT {col_list} FROM {table}')
+            cur.execute(f"""
+                SELECT {col_list} FROM {table} WHERE expiration = %s
+            """, (today_str,))
             for row in cur.fetchall():
                 for sym in row:
                     if sym:
                         symbols.add(sym)
-            conn.rollback()   # close out this read-only transaction (2026-08-26 lock-contention fix)
+            conn.rollback()   # close out this read-only transaction
         return symbols
     except Exception as e:
         print(f'[db] _other_strategy_leg_symbols failed: {e}')
         return set()
 
 
-# ── MARKET HOURS ───────────────────────────────────────────────────────────────
+# ── MARKET HOURS / TIMING ──────────────────────────────────────────────────────
 
 def is_market_hours():
     now = datetime.now(ET)
@@ -567,16 +625,28 @@ def _in_entry_window():
     return (ENTRY_HOUR_START * 60 + ENTRY_MIN_START) <= mins <= (ENTRY_HOUR_END * 60 + ENTRY_MIN_END)
 
 
+def _is_force_close_time():
+    now = datetime.now(ET)
+    return now.hour > FORCE_CLOSE_HOUR or (
+        now.hour == FORCE_CLOSE_HOUR and now.minute >= FORCE_CLOSE_MIN
+    )
+
+
 def _is_summary_time():
     now = datetime.now(ET)
     return now.hour == SUMMARY_HOUR and now.minute >= SUMMARY_MIN
 
 
+def _is_vitals_window():
+    now = datetime.now(ET)
+    return now.hour == VITALS_HOUR and VITALS_MIN_START <= now.minute <= VITALS_MIN_END
+
+
 # ── DISCORD ────────────────────────────────────────────────────────────────────
 
 def _discord(msg):
-    """Rate-limit-aware Discord post, prefixed to distinguish from credit_spread_strat.py's
-    unprefixed alerts (that file posts no prefix — confirmed by reading its _discord() calls).
+    """Rate-limit-aware Discord post, prefixed [0DTE-V2] to distinguish from the
+    retired [0DTE] naming and from the other two strategies' own messages.
     ACTIVE-gated."""
     if not ACTIVE:
         return
@@ -620,10 +690,10 @@ def _log(entry):
 
 
 def _log_trade(entry):
-    """Permanent trade history — never truncated. Same caveat as credit_spread_strat.py:
-    this file lives on Railway's ephemeral container filesystem, NOT synced to Postgres.
-    It resets on redeploy. Alpaca's own order/activity history is the durable source of
-    truth for closed trades, not this file."""
+    """Permanent trade history — never truncated. Lives on Railway's ephemeral
+    container filesystem, NOT synced to Postgres; resets on redeploy. Alpaca's
+    own order/activity history is the durable source of truth for closed
+    trades, same caveat as the other two strategies."""
     try:
         try:
             with open(TRADE_LOG_FILE) as f:
@@ -637,23 +707,23 @@ def _log_trade(entry):
         print(f'  [_log_trade] write failed: {e}')
 
 
-# ── POSITIONS / WEEKLY STATE ────────────────────────────────────────────────────
+# ── POSITIONS STATE ────────────────────────────────────────────────────────────
+# zero_dte_v2_positions (Postgres, primary) / zero_dte_v2_positions.json (fallback)
 #
-# '_degraded' marker (2026-08-26 fix — mirrors the real data-loss incident
-# root-caused in credit_spread_strat.py): a Postgres outage can make
-# _load_positions() fall back to a LOCAL JSON file that's only ever updated
-# when a *write* fails — frozen at container-boot state (empty) the whole
-# time DB writes had been succeeding. _save_positions() is called
-# unconditionally from _send_morning_vitals / _check_daily_summary /
-# _attempt_entry regardless of whether the in-memory state was actually
-# complete. The moment Postgres recovers and one of those unconditional saves
-# fires, it would overwrite real Postgres rows with that stale/empty fallback
-# via the full DELETE+reinsert in _db_save_positions(). Fix: every pos_state
-# dict now carries a '_degraded' flag set by _load_positions() — True means
-# "this came from the JSON fallback because a DB read that should have
-# succeeded didn't" — and _save_positions() refuses to persist anything (DB
-# or JSON) while that flag is set, alerting instead of silently destroying
-# data.
+# '_degraded' marker (same fix as credit_spread_strat.py / iron_condor_strat.py,
+# 2026-08-26 incident): a Postgres outage can make _load_positions() fall back
+# to a LOCAL JSON file that's only ever updated when a *write* fails — frozen
+# at container-boot state (empty) the whole time DB writes had been
+# succeeding. _save_positions() is called unconditionally from
+# _send_morning_vitals / _check_daily_summary / _attempt_entry regardless of
+# whether the in-memory state was actually complete. The moment Postgres
+# recovers and one of those unconditional saves fires, it would overwrite real
+# Postgres rows with that stale/empty fallback via the full DELETE+reinsert in
+# _db_save_positions(). Fix: every pos_state dict now carries a '_degraded'
+# flag set by _load_positions() — True means "this came from the JSON
+# fallback because a DB read that should have succeeded didn't" —
+# _save_positions() refuses to persist anything (DB or JSON) while that flag
+# is set, and _check_entry_conditions() refuses to trade on it.
 
 _db_degraded_alert_sent = False   # dedup: alert once per outage, not every scan
 
@@ -714,6 +784,10 @@ def _save_positions(ps):
     except Exception as e:
         print(f'  [_save_positions] failed: {e}')
 
+
+# ── WEEKLY STATE ───────────────────────────────────────────────────────────────
+# zero_dte_v2_state — isolated from credit_spread_strat.py's and
+# iron_condor_strat.py's own weekly tracking. Own $1,000 limit, own row.
 
 def _this_monday():
     today = datetime.now(ET).date()
@@ -778,11 +852,9 @@ def _reset_weekly_if_needed(w):
     monday = _this_monday()
     if w.get('week_start_date') != monday:
         print(f'  [weekly reset] New week {monday} — loss and cooldown cleared')
-        # _empty_weekly() builds a fresh dict with no '_degraded' key at all, which
-        # would read as falsy and bypass the refuse-to-save check in _save_weekly()
-        # below — so a stale, degraded fallback whose old week_start_date looks
-        # "expired" would otherwise sail straight past the guard and overwrite
-        # real Postgres state with zeros. Carry the flag through explicitly.
+        # Carry the '_degraded' flag through explicitly — _empty_weekly() builds
+        # a fresh dict with no '_degraded' key at all, which would read as falsy
+        # and bypass the refuse-to-save guard in _save_weekly() below.
         degraded = w.get('_degraded', False)
         w = _empty_weekly()
         w['_degraded'] = degraded
@@ -801,7 +873,7 @@ def _init_files():
     ]
     for path, empty in defaults:
         if DATABASE_URL and path in (POSITIONS_FILE, WEEKLY_FILE):
-            continue
+            continue  # DB is the primary store for these two files
         if not os.path.exists(path):
             with open(path, 'w') as f:
                 json.dump(empty, f, indent=2)
@@ -812,12 +884,13 @@ def _init_files():
 
 def _reconcile_on_startup():
     """
-    Load state files, cross-check against Alpaca open options positions, and
-    return (pos_state, weekly). Mirrors credit_spread_strat.py's reconcile
-    (pending-close-first, then leg-count mismatch), with one addition: legs
-    belonging to credit_spread_strat.py (read from its own Postgres table) are
-    excluded before computing "orphaned" legs, since both strategies share
-    this Alpaca account.
+    Load state, cross-check against Alpaca open SPY option legs dated today,
+    and return (pos_state, weekly).
+
+    Unlike credit_spread_strat.py / iron_condor_strat.py (which exclude every
+    today-dated leg outright), this strategy's own legs ARE dated today, so it
+    must instead exclude the specific legs belonging to a sibling strategy's
+    position that happens to expire today — see _other_strategy_leg_symbols().
     """
     pos_state = _load_positions()
     weekly    = _load_weekly()
@@ -828,19 +901,18 @@ def _reconcile_on_startup():
         r = _alpaca_get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers())
         if r is None:
             raise RuntimeError('positions fetch returned None after retries')
-        today_ymd = datetime.now(ET).strftime('%y%m%d')
+        yy_mm_dd   = datetime.now(ET).strftime('%y%m%d')
         other_legs = _other_strategy_leg_symbols()
         option_legs = [
             p for p in r.json()
             if p.get('asset_class') == 'us_option'
-            and any(str(p.get('symbol', '')).startswith(t) for t in TICKERS)
-            and str(p.get('symbol', ''))[3:9] != today_ymd   # ignore 0DTE legs
-            and p.get('symbol', '') not in other_legs        # ignore credit_spread_strat.py's legs
+            and str(p.get('symbol', '')).startswith(f'SPY{yy_mm_dd}')
+            and p.get('symbol', '') not in other_legs
         ]
 
-        # Resolve positions whose close order filled while the process was down —
-        # must happen before expected_legs is computed, same ordering rationale as
-        # credit_spread_strat.py's 2026-08-16 fix.
+        # Resolve positions whose profit-target close order filled while the
+        # process was down. Must happen before expected_legs is computed —
+        # same ordering rationale as credit_spread_strat.py's 2026-08-16 fix.
         resolved_pending = []
         for pos in pos_state.get('positions', []):
             pending_id = pos.get('pending_close_order_id')
@@ -848,17 +920,12 @@ def _reconcile_on_startup():
                 continue
             order = _get_order(pending_id)
             if order and order.get('status') == 'filled':
-                put_cost, call_cost = _leg_close_costs_from_order(order, pos)
-                label = _pos_label(pos)
+                fill_cost = float(order['filled_avg_price'])
+                label = f'SPY {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P {pos["expiration"]}'
                 print(f'[reconcile] Pending close {pending_id[:8]}… confirmed filled — recording exit')
-                _log({'timestamp': now_str, 'event': 'CLOSE_CONFIRMED_ON_RECONCILE',
-                      'label': label, 'order_id': pending_id,
-                      'put_close_cost': put_cost, 'call_close_cost': call_cost})
-                # pending_close_order_id is only ever set from a profit-target limit
-                # close (stop-loss/expiration closes are market orders, recorded
-                # synchronously) — same invariant as credit_spread_strat.py.
-                _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET',
-                             put_cost, call_cost, now_str)
+                _log({'timestamp': now_str, 'event': 'PROFIT_TARGET_CLOSE_CONFIRMED_ON_RECONCILE',
+                      'label': label, 'order_id': pending_id, 'fill_cost': fill_cost})
+                _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET', fill_cost, now_str)
                 resolved_pending.append(pos)
         for pos in resolved_pending:
             try:
@@ -869,20 +936,21 @@ def _reconcile_on_startup():
             _save_positions(pos_state)
             _save_weekly(weekly)
 
-        expected_legs = len(pos_state.get('positions', [])) * 4
+        expected_legs = len(pos_state.get('positions', [])) * 2
         actual_legs   = len(option_legs)
 
         if actual_legs == expected_legs:
-            print(f'[reconcile] Alpaca options OK — '
-                  f'{actual_legs} leg(s) / {len(pos_state["positions"])} condor(s)')
+            print(f'[reconcile] Alpaca 0DTE-V2 OK — '
+                  f'{actual_legs} leg(s) / {len(pos_state["positions"])} spread(s)')
         else:
             orphaned = actual_legs - expected_legs
             direction = f'{orphaned} untracked leg(s) — new entries blocked' if orphaned > 0 \
                         else f'{-orphaned} extra state entry(ies) — stale entries possible'
             msg = (
                 f'⚠️ OPTIONS MISMATCH on startup | '
-                f'Alpaca: {actual_legs} option leg(s) (excluding credit_spread_strat.py legs), '
-                f'state file expects {expected_legs} ({len(pos_state["positions"])} condor(s)). '
+                f'Alpaca: {actual_legs} 0DTE option leg(s) (excluding sibling-strategy '
+                f'expiring legs), state file expects {expected_legs} '
+                f'({len(pos_state["positions"])} spread(s)). '
                 f'{direction}. Manual review required.'
             )
             print(f'[reconcile] {msg}')
@@ -891,8 +959,25 @@ def _reconcile_on_startup():
                   'alpaca_symbols': [p['symbol'] for p in option_legs]})
             _discord(msg)
 
-            for _ in range(max(0, orphaned // 4)):
-                pos_state['positions'].append(_unknown_placeholder(now_str))
+            for _ in range(max(0, orphaned // 2)):
+                pos_state['positions'].append({
+                    'short_symbol':   'UNKNOWN',
+                    'long_symbol':    'UNKNOWN',
+                    'short_strike':   0.0,
+                    'long_strike':    0.0,
+                    'expiration':     '2099-01-01',
+                    'credit':         0.0,
+                    'max_risk':       0.0,
+                    'breakeven':      0.0,
+                    'profit_target':  0.0,
+                    'stop_loss_cost': 999.0,
+                    'open_time':      now_str,
+                    'entry_order_id': None,
+                    'short_delta':    None,
+                    'spy_entry_px':   None,
+                    'reconciled':     True,
+                    'note':           'Untracked Alpaca position — manual close required',
+                })
             if orphaned > 0:
                 _save_positions(pos_state)
 
@@ -903,9 +988,14 @@ def _reconcile_on_startup():
     positions = pos_state.get('positions', [])
     tracked   = [p for p in positions if not p.get('reconciled')]
     if positions:
-        labels = [_pos_label(p) + (' [UNTRACKED]' if p.get('reconciled') else '') for p in positions]
+        labels = [
+            f'{p.get("short_strike", 0):.0f}/{p.get("long_strike", 0):.0f}P '
+            f'exp={p.get("expiration", "?")}  credit=${p.get("credit", 0):.2f}'
+            + (' [UNTRACKED]' if p.get('reconciled') else '')
+            for p in positions
+        ]
         print(f'[startup] Resumed {len(tracked)} tracked + '
-              f'{len(positions) - len(tracked)} untracked condor(s):')
+              f'{len(positions) - len(tracked)} untracked position(s):')
         for lbl in labels:
             print(f'  {lbl}')
         _log({'timestamp': now_str, 'event': 'STARTUP_RESUME',
@@ -921,32 +1011,10 @@ def _reconcile_on_startup():
     return pos_state, weekly
 
 
-def _unknown_placeholder(now_str):
-    return {
-        'short_put_symbol': 'UNKNOWN', 'long_put_symbol': 'UNKNOWN',
-        'short_call_symbol': 'UNKNOWN', 'long_call_symbol': 'UNKNOWN',
-        'short_put_strike': 0.0, 'long_put_strike': 0.0,
-        'short_call_strike': 0.0, 'long_call_strike': 0.0,
-        'expiration': '2099-01-01',   # far future — never triggers expiry close
-        'put_credit': 0.0, 'call_credit': 0.0, 'total_credit': 0.0,
-        'max_risk': 0.0, 'put_breakeven': 0.0, 'call_breakeven': 0.0,
-        'profit_target': 0.0, 'put_stop_cost': 999.0, 'call_stop_cost': 999.0,
-        'open_time': now_str, 'entry_order_id': None,
-        'short_put_delta': None, 'short_call_delta': None, 'spy_entry_px': None,
-        'reconciled': True,
-        'note': 'Untracked Alpaca position — manual close required',
-    }
-
-
-def _pos_label(pos):
-    return (f'{pos.get("short_put_strike", 0):.0f}/{pos.get("long_put_strike", 0):.0f}P '
-            f'{pos.get("short_call_strike", 0):.0f}/{pos.get("long_call_strike", 0):.0f}C '
-            f'exp={pos.get("expiration", "?")}  credit=${pos.get("total_credit", 0):.2f}')
-
-
 # ── MARKET DATA ────────────────────────────────────────────────────────────────
 
 def _flatten_columns(df):
+    """Handle MultiIndex columns returned by yfinance >=0.2 for single-ticker downloads."""
     if hasattr(df.columns, 'levels'):
         try:
             df.columns = df.columns.droplevel(1)
@@ -955,9 +1023,10 @@ def _flatten_columns(df):
     return df
 
 
-def _above_sma20(ticker):
+def _above_sma20():
+    """Return (above_sma: bool|None, close: float|None, sma: float|None)."""
     try:
-        df = yf.download(ticker, period='40d', interval='1d',
+        df = yf.download('SPY', period='40d', interval='1d',
                          progress=False, auto_adjust=True, timeout=10)
         if df.empty:
             return None, None, None
@@ -993,36 +1062,13 @@ def _vix_ivrank():
         return None, None
 
 
-def _bs_iv_solve(S, K, T, mkt_price, is_call):
-    """Bisection IV solver from an observed option price. Returns decimal IV."""
-    if T <= 0 or mkt_price <= 0 or S <= 0 or K <= 0:
-        return None
-    lo, hi = 0.001, 5.0
-    r = RISK_FREE_RATE
-    for _ in range(80):
-        mid = (lo + hi) / 2
-        d1  = (math.log(S / K) + (r + 0.5 * mid ** 2) * T) / (mid * math.sqrt(T))
-        d2  = d1 - mid * math.sqrt(T)
-        if is_call:
-            p = S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
-        else:
-            p = K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-        if p < mkt_price:
-            lo = mid
-        else:
-            hi = mid
-        if hi - lo < 1e-6:
-            break
-    return (lo + hi) / 2
-
-
 def _spy_ivrank():
     """
     Return (ivr_pct: float|None, current_iv_pct: float|None).
     IVR = percentile of current SPY ATM IV within 252-day Parkinson vol range.
-    Identical methodology to credit_spread_strat.py's _spy_ivrank — same live
-    SPY ATM put IV (via Alpaca), same Parkinson realized-vol window as the
-    denominator. Falls back to _vix_ivrank() if the SPY options fetch fails.
+    Identical implementation to credit_spread_strat.py._spy_ivrank() /
+    iron_condor_strat.py._spy_ivrank(). Falls back to _vix_ivrank() if the SPY
+    options fetch fails.
     """
     current_iv = None
     try:
@@ -1092,7 +1138,7 @@ def _spy_ivrank():
             if bid + ask > 0:
                 K  = float(atm.get('strike_price', S))
                 T  = (date.fromisoformat(best_exp) - today).days / 365.0
-                current_iv = _bs_iv_solve(S, K, T, (bid + ask) / 2, is_call=False)
+                current_iv = _bs_iv_solve(S, K, T, (bid + ask) / 2)
             if current_iv is None:
                 raise ValueError('IV not available in snapshot; back-solve also failed')
 
@@ -1129,70 +1175,114 @@ def _spy_ivrank():
         return _vix_ivrank()
 
 
-# ── OPTIONS CHAIN ──────────────────────────────────────────────────────────────
+# ── BLACK-SCHOLES HELPERS ──────────────────────────────────────────────────────
 
-def _find_target_expiration(ticker):
-    """Return expiry closest to TARGET_DTE. Widens to 5–10 DTE if needed."""
+def _0dte_T_years():
+    """
+    Remaining fraction of trading year for a 0DTE option right now.
+    Wall-clock hours remaining until 4:00pm ET, divided by
+    (6.5 trading hours × 252 trading days). Floored at ~1 minute.
+    """
+    now_et   = datetime.now(ET)
+    close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    remaining_hours = max((close_et - now_et).total_seconds() / 3600.0, 1 / 60)
+    return remaining_hours / (6.5 * 252)
+
+
+def _bs_put_delta(S, K, T_years, sigma):
+    """Black-Scholes European put delta in [-1, 0]. Returns None on error."""
     try:
-        expirations = yf.Ticker(ticker).options
-        if not expirations:
-            return None
-        today     = date.today()
-        best      = None
-        best_diff = float('inf')
-        for exp_str in expirations:
-            exp = date.fromisoformat(exp_str)
-            dte = (exp - today).days
-            if DTE_MIN <= dte <= DTE_MAX:
-                diff = abs(dte - TARGET_DTE)
-                if diff < best_diff:
-                    best, best_diff = exp, diff
-        if best:
-            return best
-        for exp_str in expirations:
-            exp = date.fromisoformat(exp_str)
-            dte = (exp - today).days
-            if 5 <= dte <= 10:
-                diff = abs(dte - TARGET_DTE)
-                if diff < best_diff:
-                    best, best_diff = exp, diff
-        return best
-    except Exception as e:
-        print(f'  [find_expiry] {e}')
+        if T_years <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return -1.0 if K > S else 0.0
+        d1 = (math.log(S / K) + (RISK_FREE_RATE + 0.5 * sigma ** 2) * T_years) / (
+            sigma * math.sqrt(T_years)
+        )
+        return norm.cdf(d1) - 1.0
+    except Exception:
         return None
 
 
-def _fetch_options_chain_side(ticker, expiry, opt_type, now_str):
+def _bs_iv_solve(S, K, T_years, mkt_price):
+    """Bisection IV solver from observed put price. Returns decimal IV (e.g. 0.13)."""
+    if T_years <= 0 or mkt_price <= 0 or S <= 0 or K <= 0:
+        return None
+    lo, hi = 0.001, 5.0
+    r = RISK_FREE_RATE
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        d1  = (math.log(S / K) + (r + 0.5 * mid ** 2) * T_years) / (mid * math.sqrt(T_years))
+        d2  = d1 - mid * math.sqrt(T_years)
+        p   = K * math.exp(-r * T_years) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        if p < mkt_price:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-6:
+            break
+    return (lo + hi) / 2
+
+
+# ── OPTIONS CHAIN ──────────────────────────────────────────────────────────────
+
+def _find_today_expiration():
+    """Return today's date if SPY has 0DTE options today, else None."""
+    try:
+        today = datetime.now(ET).date()
+        if today.weekday() >= 5:
+            return None
+        expirations = yf.Ticker('SPY').options
+        if today.isoformat() in expirations:
+            return today
+        # yfinance sometimes omits today pre-open — check Alpaca directly
+        r = _alpaca_get(
+            f'{PAPER_BASE_URL}/v2/options/contracts',
+            headers=_headers(),
+            params={
+                'underlying_symbol': 'SPY',
+                'type':              'put',
+                'expiration_date':   today.isoformat(),
+                'limit': 1,
+                'status': 'active',
+            }
+        )
+        if r and r.json().get('option_contracts'):
+            return today
+        return None
+    except Exception as e:
+        print(f'  [find_0dte_expiry] {e}')
+        return None
+
+
+def _fetch_0dte_chain(expiry, now_str):
     """
-    Fetch put OR call chain for ticker/expiry (opt_type: 'put' | 'call').
-    Same two-step pattern as credit_spread_strat.py: contracts (trading API),
-    then snapshots (market data API) for bid/ask/mid/delta/iv.
-    Returns dict {symbol: {strike, bid, ask, mid, delta, iv, type}} or None.
+    Fetch the full SPY 0DTE put chain for today.
+    Contracts: paper-api.alpaca.markets/v2/options/contracts (trading API)
+    Snapshots: data.alpaca.markets/v1beta1/options/snapshots (market data API)
+    Returns dict {symbol: {strike, bid, ask, mid, delta, iv}} or None on failure.
     """
     try:
         r = _alpaca_get(
             f'{PAPER_BASE_URL}/v2/options/contracts',
             headers=_headers(),
             params={
-                'underlying_symbols': ticker,
-                'type':               opt_type,
+                'underlying_symbols': 'SPY',
+                'type':               'put',
                 'expiration_date':    expiry.isoformat(),
                 'limit':              200,
             },
             timeout=15,
         )
         if r is None:
-            reason = f'{opt_type} contracts fetch returned None after retries'
-            print(f'  [chain] {reason}')
-            _log({'timestamp': now_str, 'event': 'CHAIN_FETCH_ERROR',
-                  'opt_type': opt_type, 'expiry': str(expiry), 'reason': reason})
+            reason = 'contracts fetch returned None after retries'
+            print(f'  [0dte chain] {reason}')
+            _log({'timestamp': now_str, 'event': 'CHAIN_FETCH_ERROR', 'reason': reason})
             return None
         contracts = r.json().get('option_contracts', [])
         if not contracts:
-            reason = f'no {opt_type} contracts returned by Alpaca for expiry {expiry}'
-            print(f'  [chain] {reason}')
-            _log({'timestamp': now_str, 'event': 'CHAIN_EMPTY', 'opt_type': opt_type,
-                  'expiry': str(expiry), 'reason': reason})
+            reason = f'no contracts returned by Alpaca for expiry {expiry}'
+            print(f'  [0dte chain] {reason}')
+            _log({'timestamp': now_str, 'event': 'CHAIN_EMPTY', 'expiry': str(expiry),
+                  'reason': reason})
             return None
 
         symbols    = [c['symbol'] for c in contracts]
@@ -1209,8 +1299,8 @@ def _fetch_options_chain_side(ticker, expiry, opt_type, now_str):
                     timeout=15,
                 )
                 if rs is None:
-                    reason = f'{opt_type} snapshots batch failed after retries (offset {batch_start})'
-                    print(f'  [chain] {reason}')
+                    reason = f'snapshots batch failed after retries (offset {batch_start})'
+                    print(f'  [0dte chain] {reason}')
                     _log({'timestamp': now_str, 'event': 'CHAIN_BATCH_ERROR', 'reason': reason})
                     continue
                 for sym, snap in rs.json().get('snapshots', {}).items():
@@ -1226,70 +1316,43 @@ def _fetch_options_chain_side(ticker, expiry, opt_type, now_str):
                         'mid':    mid,
                         'delta':  float(g['delta']) if g.get('delta') is not None else None,
                         'iv':     snap.get('impliedVolatility'),
-                        'type':   opt_type,
                     }
             except Exception as e:
-                reason = f'{opt_type} snapshot batch error: {type(e).__name__}: {e}'
-                print(f'  [chain] {reason}')
+                reason = f'snapshot batch error: {type(e).__name__}: {e}'
+                print(f'  [0dte chain] {reason}')
                 _log({'timestamp': now_str, 'event': 'CHAIN_BATCH_ERROR', 'reason': reason})
 
         if not chain:
-            reason = f'all {opt_type} snapshot batches returned empty'
-            print(f'  [chain] {reason}')
-            _log({'timestamp': now_str, 'event': 'CHAIN_EMPTY', 'opt_type': opt_type,
-                  'expiry': str(expiry), 'reason': reason})
+            reason = 'all snapshot batches returned empty'
+            print(f'  [0dte chain] {reason}')
+            _log({'timestamp': now_str, 'event': 'CHAIN_EMPTY', 'expiry': str(expiry),
+                  'reason': reason})
             return None
 
         return chain
 
     except Exception as e:
         reason = f'{type(e).__name__}: {e}'
-        print(f'  [chain] {opt_type} fetch failed: {reason}')
-        _log({'timestamp': now_str, 'event': 'CHAIN_FETCH_ERROR', 'opt_type': opt_type,
-              'expiry': str(expiry), 'reason': reason})
+        print(f'  [0dte chain] fetch failed: {reason}')
+        _log({'timestamp': now_str, 'event': 'CHAIN_FETCH_ERROR', 'expiry': str(expiry),
+              'reason': reason})
         return None
 
 
-def _fetch_combined_chain(ticker, expiry, now_str):
-    """Fetch and merge put + call chains into one {symbol: {...}} dict."""
-    put_chain  = _fetch_options_chain_side(ticker, expiry, 'put', now_str)
-    call_chain = _fetch_options_chain_side(ticker, expiry, 'call', now_str)
-    if put_chain is None or call_chain is None:
-        return None
-    merged = {}
-    merged.update(put_chain)
-    merged.update(call_chain)
-    return merged
+def _find_short_strike(chain, spy_px, vix, now_str):
+    """
+    Find OTM put with |delta| closest to TARGET_DELTA (0.275, i.e. the 25-30
+    delta band via DELTA_TOLERANCE=0.025).
 
+    Delta priority per contract:
+      1. Alpaca greeks.delta  (most accurate)
+      2. Per-contract impliedVolatility via Black-Scholes with intraday T
+      3. VIX / 100 via Black-Scholes (last resort)
 
-def _bs_put_delta(S, K, T_years, sigma):
-    try:
-        if T_years <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-            return -1.0 if K > S else 0.0
-        d1 = (math.log(S / K) + (RISK_FREE_RATE + 0.5 * sigma ** 2) * T_years) / (
-            sigma * math.sqrt(T_years)
-        )
-        return norm.cdf(d1) - 1.0
-    except Exception:
-        return None
-
-
-def _bs_call_delta(S, K, T_years, sigma):
-    try:
-        if T_years <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-            return 1.0 if K < S else 0.0
-        d1 = (math.log(S / K) + (RISK_FREE_RATE + 0.5 * sigma ** 2) * T_years) / (
-            sigma * math.sqrt(T_years)
-        )
-        return norm.cdf(d1)
-    except Exception:
-        return None
-
-
-def _find_short_put_strike(chain, spy_px, expiry, vix, now_str):
-    """Find OTM put with |delta| closest to TARGET_DELTA. Same priority order as
-    credit_spread_strat.py: Alpaca greeks → per-contract IV via BS → VIX fallback."""
-    T_years        = max((expiry - date.today()).days / 365.0, 1 / 365)
+    Rejects result if best |delta| is > DELTA_TOLERANCE from target.
+    Returns (symbol, strike, delta) or (None, None, None).
+    """
+    T_years        = _0dte_T_years()
     sigma_fallback = (vix or 20.0) / 100.0
 
     best_sym, best_strike, best_delta = None, None, None
@@ -1297,11 +1360,9 @@ def _find_short_put_strike(chain, spy_px, expiry, vix, now_str):
     bs_used = bs_failed = 0
 
     for sym, data in chain.items():
-        if data.get('type') != 'put':
-            continue
         strike = data['strike']
         if strike <= 0 or data['mid'] <= 0 or strike >= spy_px:
-            continue
+            continue  # skip zero-mid and ITM puts
 
         delta = data['delta']
         if delta is None:
@@ -1319,88 +1380,33 @@ def _find_short_put_strike(chain, spy_px, expiry, vix, now_str):
             best_diff, best_sym, best_strike, best_delta = diff, sym, strike, delta
 
     if bs_used or bs_failed:
-        print(f'  [chain] put BS fallback: {bs_used} used, {bs_failed} failed')
+        print(f'  [0dte chain] BS fallback: {bs_used} used, {bs_failed} failed')
 
     if best_sym is None:
-        _log({'timestamp': now_str, 'event': 'CHAIN_NO_DELTA', 'side': 'put',
-              'reason': 'no OTM puts with computable delta in chain'})
+        reason = 'no OTM puts with computable delta in chain'
+        print(f'  [0dte chain] {reason}')
+        _log({'timestamp': now_str, 'event': 'CHAIN_NO_DELTA', 'reason': reason})
         return None, None, None
 
     if best_diff > DELTA_TOLERANCE:
-        _log({'timestamp': now_str, 'event': 'CHAIN_DELTA_TOO_FAR', 'side': 'put',
-              'best_strike': best_strike, 'best_delta': round(best_delta, 4)})
+        reason = (f'closest delta={abs(best_delta):.3f} at ${best_strike:.0f} is '
+                  f'{best_diff:.3f} from target {TARGET_DELTA} '
+                  f'(tolerance {DELTA_TOLERANCE})')
+        print(f'  [0dte chain] {reason}')
+        _log({'timestamp': now_str, 'event': 'CHAIN_DELTA_TOO_FAR',
+              'reason': reason, 'best_strike': best_strike,
+              'best_delta': round(best_delta, 4)})
         return None, None, None
 
     return best_sym, best_strike, best_delta
 
 
-def _find_short_call_strike(chain, spy_px, expiry, vix, now_str):
-    """Find OTM call with delta closest to TARGET_DELTA."""
-    T_years        = max((expiry - date.today()).days / 365.0, 1 / 365)
-    sigma_fallback = (vix or 20.0) / 100.0
-
-    best_sym, best_strike, best_delta = None, None, None
-    best_diff = float('inf')
-    bs_used = bs_failed = 0
-
-    for sym, data in chain.items():
-        if data.get('type') != 'call':
-            continue
-        strike = data['strike']
-        if strike <= 0 or data['mid'] <= 0 or strike <= spy_px:
-            continue
-
-        delta = data['delta']
-        if delta is None:
-            per_iv = data.get('iv')
-            sigma  = float(per_iv) if per_iv else sigma_fallback
-            delta  = _bs_call_delta(spy_px, strike, T_years, sigma)
-            if delta is not None:
-                bs_used += 1
-            else:
-                bs_failed += 1
-                continue
-
-        diff = abs(delta - TARGET_DELTA)
-        if diff < best_diff:
-            best_diff, best_sym, best_strike, best_delta = diff, sym, strike, delta
-
-    if bs_used or bs_failed:
-        print(f'  [chain] call BS fallback: {bs_used} used, {bs_failed} failed')
-
-    if best_sym is None:
-        _log({'timestamp': now_str, 'event': 'CHAIN_NO_DELTA', 'side': 'call',
-              'reason': 'no OTM calls with computable delta in chain'})
-        return None, None, None
-
-    if best_diff > DELTA_TOLERANCE:
-        _log({'timestamp': now_str, 'event': 'CHAIN_DELTA_TOO_FAR', 'side': 'call',
-              'best_strike': best_strike, 'best_delta': round(best_delta, 4)})
-        return None, None, None
-
-    return best_sym, best_strike, best_delta
-
-
-def _find_long_put_symbol(chain, short_strike):
-    target = short_strike - SPREAD_WIDTH
-    best_sym = best_k = None
+def _find_long_symbol(chain, short_strike):
+    """Find option symbol for the long leg (short_strike − SPREAD_WIDTH = $3 lower)."""
+    target    = short_strike - SPREAD_WIDTH
+    best_sym  = best_k = None
     best_diff = float('inf')
     for sym, data in chain.items():
-        if data.get('type') != 'put':
-            continue
-        diff = abs(data['strike'] - target)
-        if diff < best_diff:
-            best_diff, best_sym, best_k = diff, sym, data['strike']
-    return best_sym, best_k
-
-
-def _find_long_call_symbol(chain, short_strike):
-    target = short_strike + SPREAD_WIDTH
-    best_sym = best_k = None
-    best_diff = float('inf')
-    for sym, data in chain.items():
-        if data.get('type') != 'call':
-            continue
         diff = abs(data['strike'] - target)
         if diff < best_diff:
             best_diff, best_sym, best_k = diff, sym, data['strike']
@@ -1408,7 +1414,7 @@ def _find_long_call_symbol(chain, short_strike):
 
 
 def _spread_mid(chain, short_sym, long_sym):
-    """Net credit = short_mid − long_mid. Works for either put or call spread."""
+    """Net credit = short_mid − long_mid. Returns None if data missing or degenerate."""
     try:
         s_mid = chain[short_sym]['mid']
         l_mid = chain[long_sym]['mid']
@@ -1423,12 +1429,10 @@ def _spread_mid(chain, short_sym, long_sym):
 
 def _current_cost_to_close(short_sym, long_sym):
     """
-    Current debit to close ONE spread (put or call) = short_mid − long_mid.
-    Positive = we pay to close. Returns 0.0 when both legs are zero-priced
-    (deeply OTM near expiry — valid, means max profit reached on that leg).
-    Returns None only on hard API failures.
-    Identical logic to credit_spread_strat.py's version — works for either
-    the put spread or the call spread, called once per side.
+    Current debit to close = short_mid − long_mid.
+    Positive = we pay to close (normal for a short spread).
+    Returns 0.0 when both legs are zero-priced (deeply OTM near expiry — valid,
+    means max profit reached). Returns None only on hard API failures.
     """
     ts = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
     try:
@@ -1442,7 +1446,7 @@ def _current_cost_to_close(short_sym, long_sym):
             if rs is not None:
                 break
             if _outer == 0:
-                time.sleep(5)
+                time.sleep(5)   # one 5s pause before second full attempt
         if rs is None:
             reason = f'API returned None after retries ({short_sym}, {long_sym})'
             print(f'  [cost_to_close] {reason}')
@@ -1491,19 +1495,10 @@ def _current_cost_to_close(short_sym, long_sym):
 
 # ── ORDER MANAGEMENT ───────────────────────────────────────────────────────────
 # No Alpaca SDK. Uses Alpaca v2 REST API via requests==2.32.5.
-# Multi-leg spread orders: POST /v2/orders with order_class='mleg', up to 4 legs
-# (Alpaca API reference: legs array maxItems=4). One 4-leg order opens/closes
-# the whole condor atomically, rather than two separate 2-leg orders — avoids the
-# risk of only the put spread or only the call spread filling and leaving a
-# naked, unintended position.
-#
-# limit_price sign convention (Alpaca API reference, confirmed 2026-08-20):
-#   positive = net DEBIT (you pay)     negative = net CREDIT (you receive)
-# Opening this condor is a net credit  → limit_price must be NEGATIVE.
-# Closing it (buying it back) is a net debit → limit_price stays POSITIVE.
+# Multi-leg spread orders: POST /v2/orders with order_class='mleg'.
 
-def _place_open_order(short_put, long_put, short_call, long_call, total_credit):
-    """Limit order to open the condor (4 legs, 1 order). ACTIVE-gated."""
+def _place_open_order(short_sym, long_sym, credit):
+    """Limit order to open the credit spread. ACTIVE-gated."""
     if not ACTIVE:
         return None
     try:
@@ -1512,15 +1507,11 @@ def _place_open_order(short_put, long_put, short_call, long_call, total_credit):
             'type':          'limit',
             'time_in_force': 'day',
             'order_class':   'mleg',
-            'limit_price':   str(round(-total_credit, 2)),   # negative = credit
+            'limit_price':   str(round(-credit, 2)),   # negative = credit (Alpaca mleg convention)
             'legs': [
-                {'symbol': short_put,  'side': 'sell',
+                {'symbol': short_sym, 'side': 'sell',
                  'ratio_qty': '1', 'position_intent': 'sell_to_open'},
-                {'symbol': long_put,   'side': 'buy',
-                 'ratio_qty': '1', 'position_intent': 'buy_to_open'},
-                {'symbol': short_call, 'side': 'sell',
-                 'ratio_qty': '1', 'position_intent': 'sell_to_open'},
-                {'symbol': long_call,  'side': 'buy',
+                {'symbol': long_sym,  'side': 'buy',
                  'ratio_qty': '1', 'position_intent': 'buy_to_open'},
             ],
         }
@@ -1533,11 +1524,8 @@ def _place_open_order(short_put, long_put, short_call, long_call, total_credit):
         return None
 
 
-def _place_close_order(short_put, long_put, short_call, long_call,
-                        order_type='market', limit_price=None):
-    """Order to close all 4 legs of the condor in one order. ACTIVE-gated.
-    order_type: 'market' | 'limit'. limit_price (if given) is the max net
-    debit willing to pay — positive, matching Alpaca's debit convention."""
+def _place_close_order(short_sym, long_sym, order_type='market', limit_price=None):
+    """Order to close the spread. ACTIVE-gated. order_type: 'market' | 'limit'."""
     if not ACTIVE:
         return None
     try:
@@ -1547,13 +1535,9 @@ def _place_close_order(short_put, long_put, short_call, long_call,
             'time_in_force': 'day',
             'order_class':   'mleg',
             'legs': [
-                {'symbol': short_put,  'side': 'buy',
+                {'symbol': short_sym, 'side': 'buy',
                  'ratio_qty': '1', 'position_intent': 'buy_to_close'},
-                {'symbol': long_put,   'side': 'sell',
-                 'ratio_qty': '1', 'position_intent': 'sell_to_close'},
-                {'symbol': short_call, 'side': 'buy',
-                 'ratio_qty': '1', 'position_intent': 'buy_to_close'},
-                {'symbol': long_call,  'side': 'sell',
+                {'symbol': long_sym,  'side': 'sell',
                  'ratio_qty': '1', 'position_intent': 'sell_to_close'},
             ],
         }
@@ -1579,6 +1563,26 @@ def _get_order(order_id):
         return None
 
 
+def _verify_close_fill(order_id, quoted_cost, label, now_str):
+    """After a market close fills, pull the real filled_avg_price instead of
+    trusting the pre-order quoted cost — market orders can slip between the
+    quote that triggered the order and the actual fill. Falls back to the
+    quoted cost (with an explicit log entry) if the fill can't be confirmed
+    within a few seconds."""
+    for _ in range(3):
+        order = _get_order(order_id)
+        if order and order.get('status') == 'filled':
+            raw = order.get('filled_avg_price')
+            if raw is not None:
+                return abs(float(raw))
+            break
+        time.sleep(2)
+    print(f'  {label}: could not verify market close fill — using quoted cost ${quoted_cost:.4f}')
+    _log({'timestamp': now_str, 'event': 'CLOSE_FILL_UNVERIFIED',
+          'label': label, 'order_id': order_id, 'quoted_cost': quoted_cost})
+    return quoted_cost
+
+
 def _cancel_order(order_id):
     if not ACTIVE:
         return
@@ -1591,84 +1595,23 @@ def _cancel_order(order_id):
         print(f'  [cancel_order] {e}')
 
 
-def _leg_fill_prices(order):
-    """Extract per-leg filled_avg_price from a filled mleg order's legs array.
-    Returns {symbol: price} for legs that reported a fill."""
-    out = {}
-    for leg in order.get('legs') or []:
-        px = leg.get('filled_avg_price')
-        if px is not None:
-            out[leg['symbol']] = abs(float(px))
-    return out
-
-
-def _leg_close_costs_from_order(order, pos):
-    """Given a filled 4-leg close order and the position it closed, split the
-    combined fill into (put_close_cost, call_close_cost) using per-leg fills.
-    Falls back to the order-level filled_avg_price split proportionally by
-    stop/target thresholds if per-leg data is missing (should not normally
-    happen for a filled mleg order, but this must never crash the reconcile
-    or monitor loop)."""
-    fills = _leg_fill_prices(order)
-    sp, lp = pos.get('short_put_symbol'), pos.get('long_put_symbol')
-    sc, lc = pos.get('short_call_symbol'), pos.get('long_call_symbol')
-    if all(s in fills for s in (sp, lp, sc, lc)):
-        put_cost  = round(fills[sp] - fills[lp], 4)
-        call_cost = round(fills[sc] - fills[lc], 4)
-        return put_cost, call_cost
-    # fallback: split the order-level combined price using the pre-close ratio
-    # of each side's credit as a weight — imperfect, but only used if Alpaca
-    # omits per-leg fills, which normal mleg fills always include.
-    raw = order.get('filled_avg_price')
-    combined = abs(float(raw)) if raw is not None else (pos.get('profit_target') or 0.0)
-    put_credit  = pos.get('put_credit', 0.0) or 0.0
-    call_credit = pos.get('call_credit', 0.0) or 0.0
-    total = put_credit + call_credit
-    if total <= 0:
-        return combined / 2, combined / 2
-    return round(combined * put_credit / total, 4), round(combined * call_credit / total, 4)
-
-
-def _verify_close_fill(order_id, pos, quoted_put_cost, quoted_call_cost, label, now_str):
-    """After a market stop-loss close fills, pull real per-leg fills via
-    _leg_close_costs_from_order() instead of trusting the pre-order quoted costs —
-    same rationale as credit_spread_strat.py's _verify_close_fill. Falls back to the
-    quoted costs (with an explicit log entry) if the fill can't be confirmed in time."""
-    for _ in range(3):
-        order = _get_order(order_id)
-        if order and order.get('status') == 'filled':
-            return _leg_close_costs_from_order(order, pos)
-        time.sleep(2)
-    print(f'  {label}: could not verify market close fill — using quoted costs '
-          f'put ${quoted_put_cost:.4f} / call ${quoted_call_cost:.4f}')
-    _log({'timestamp': now_str, 'event': 'CLOSE_FILL_UNVERIFIED', 'label': label,
-          'order_id': order_id, 'quoted_put_cost': quoted_put_cost,
-          'quoted_call_cost': quoted_call_cost})
-    return quoted_put_cost, quoted_call_cost
-
-
 # ── ENTRY EXECUTION ────────────────────────────────────────────────────────────
 
-def _attempt_entry(pos_state, weekly, now_str, ticker,
-                   short_put, long_put, short_call, long_call,
-                   short_put_strike, long_put_strike,
-                   short_call_strike, long_call_strike,
-                   expiry, put_credit, call_credit, stock_px,
-                   short_put_delta, short_call_delta):
+def _attempt_entry(pos_state, weekly, now_str, short_sym, long_sym,
+                   short_strike, long_strike, expiry, credit, spy_px, short_delta):
     """
-    Place the 4-leg opening order, poll for fill up to ORDER_FILL_TIMEOUT seconds.
-    Updates pos_state['positions'] in place on fill. Returns True if filled.
-    ACTIVE-gated. Mirrors credit_spread_strat.py's _attempt_entry exactly, just
-    with 4 legs and put/call credit split from per-leg fills instead of 2.
+    Place opening order, poll for fill up to ORDER_FILL_TIMEOUT seconds.
+    Updates pos_state['positions'] in place on fill — fill is only ever
+    confirmed via a polled status == 'filled' read of filled_avg_price, never
+    assumed from the submitted order. Returns True if filled. ACTIVE-gated.
     """
     if not ACTIVE:
         return False
 
-    total_credit = round(put_credit + call_credit, 4)
-    order_id = _place_open_order(short_put, long_put, short_call, long_call, total_credit)
+    order_id = _place_open_order(short_sym, long_sym, credit)
     if not order_id:
         _log({'timestamp': now_str, 'event': 'ORDER_PLACE_FAILED',
-              'short_put': short_put, 'short_call': short_call, 'credit': total_credit})
+              'short': short_sym, 'long': long_sym, 'credit': credit})
         print('  [entry] order placement failed')
         return False
 
@@ -1676,83 +1619,55 @@ def _attempt_entry(pos_state, weekly, now_str, ticker,
     deadline = time.time() + ORDER_FILL_TIMEOUT
 
     while time.time() < deadline:
-        time.sleep(30)
+        time.sleep(15)
         order = _get_order(order_id)
         if order is None:
             continue
         status = order.get('status', '')
 
         if status == 'filled':
-            fills = _leg_fill_prices(order)
-            if all(s in fills for s in (short_put, long_put, short_call, long_call)):
-                fill_put_credit  = round(fills[short_put]  - fills[long_put], 4)
-                fill_call_credit = round(fills[short_call] - fills[long_call], 4)
-            else:
-                # Extremely defensive fallback — should not happen on a filled mleg order.
-                raw_price = float(order.get('filled_avg_price') or total_credit)
-                fill_combined = abs(raw_price)
-                if fill_combined != total_credit:
-                    print(f'  [entry] per-leg fills missing — using order-level '
-                          f'combined ${fill_combined:.2f} split by expected ratio')
-                fill_put_credit  = round(fill_combined * put_credit  / total_credit, 4) if total_credit else 0.0
-                fill_call_credit = round(fill_combined * call_credit / total_credit, 4) if total_credit else 0.0
-
-            fill_total = round(fill_put_credit + fill_call_credit, 4)
-            # Max loss for an iron condor with equal-width wings = width*100 - total_credit*100
-            # (only one side can be breached at expiry).
-            max_risk = round((SPREAD_WIDTH - fill_total) * 100, 2)
-            put_breakeven  = round(short_put_strike - fill_total, 2)
-            call_breakeven = round(short_call_strike + fill_total, 2)
-
+            raw_price   = float(order.get('filled_avg_price') or credit)
+            fill_credit = abs(raw_price)   # Alpaca returns negative for net credit received
+            if raw_price < 0:
+                print(f'  [entry] filled_avg_price was negative ({raw_price}) — using abs()')
+            max_risk    = round((SPREAD_WIDTH - fill_credit) * 100, 2)
+            breakeven   = round(short_strike - fill_credit, 2)
             pos = {
-                'ticker':             ticker,
-                'short_put_symbol':   short_put,
-                'long_put_symbol':    long_put,
-                'short_call_symbol':  short_call,
-                'long_call_symbol':   long_call,
-                'short_put_strike':   short_put_strike,
-                'long_put_strike':    long_put_strike,
-                'short_call_strike':  short_call_strike,
-                'long_call_strike':   long_call_strike,
-                'expiration':         expiry.isoformat(),
-                'put_credit':         fill_put_credit,
-                'call_credit':        fill_call_credit,
-                'total_credit':       fill_total,
-                'max_risk':           max_risk,
-                'put_breakeven':      put_breakeven,
-                'call_breakeven':     call_breakeven,
-                'profit_target':      round(fill_total * PROFIT_TARGET_PCT, 4),
-                'put_stop_cost':      round(fill_put_credit * STOP_LOSS_PCT, 4),
-                'call_stop_cost':     round(fill_call_credit * STOP_LOSS_PCT, 4),
-                'open_time':          now_str,
-                'entry_order_id':     order_id,
-                'short_put_delta':    round(short_put_delta, 4) if short_put_delta else None,
-                'short_call_delta':   round(short_call_delta, 4) if short_call_delta else None,
-                'spy_entry_px':       stock_px,
+                'short_symbol':   short_sym,
+                'long_symbol':    long_sym,
+                'short_strike':   short_strike,
+                'long_strike':    long_strike,
+                'expiration':     expiry.isoformat(),
+                'credit':         round(fill_credit, 4),
+                'max_risk':       max_risk,
+                'breakeven':      breakeven,
+                'profit_target':  round(fill_credit * PROFIT_TARGET_PCT, 4),
+                'stop_loss_cost': round(fill_credit * STOP_LOSS_PCT, 4),
+                'open_time':      now_str,
+                'entry_order_id': order_id,
+                'short_delta':    round(short_delta, 4) if short_delta else None,
+                'spy_entry_px':   spy_px,
             }
             pos_state['positions'].append(pos)
             _save_positions(pos_state)
             _log({'timestamp': now_str, 'event': 'ENTRY_FILLED', **pos})
             _log_trade({'timestamp': now_str, 'type': 'OPEN', **pos})
             _discord(
-                f'🟢 CONDOR OPEN | '
-                f'{ticker} {short_put_strike:.0f}/{long_put_strike:.0f}P '
-                f'{short_call_strike:.0f}/{long_call_strike:.0f}C  exp {expiry} | '
-                f'Credit: ${fill_total:.2f} (put ${fill_put_credit:.2f} / call ${fill_call_credit:.2f}) | '
-                f'Max risk: ${max_risk:.2f} | '
-                f'Breakevens: ${put_breakeven:.2f} / ${call_breakeven:.2f} | '
-                f'Positions open: {len(pos_state["positions"])}'
+                f'🟢 SPREAD OPEN | '
+                f'SPY {short_strike:.0f}/{long_strike:.0f}P  exp {expiry} | '
+                f'Credit: ${fill_credit:.2f} | Max risk: ${max_risk:.2f} | '
+                f'Breakeven: ${breakeven:.2f} | Delta: {short_delta:.3f} | '
+                f'Positions open: {len(pos_state["positions"])}/{MAX_POSITIONS}'
             )
-            print(f'  [entry] FILLED put ${fill_put_credit:.2f} / call ${fill_call_credit:.2f}  '
-                  f'{short_put} / {long_put} / {short_call} / {long_call}')
+            print(f'  [entry] FILLED ${fill_credit:.4f}  {short_sym} / {long_sym}')
             return True
 
         if status == 'partially_filled':
-            print(f'  [entry] partial fill detected on 4-leg order — cancelling {order_id}')
+            print(f'  [entry] partial fill detected on multi-leg order — cancelling {order_id}')
             _log({'timestamp': now_str, 'event': 'ORDER_PARTIAL_FILL', 'order_id': order_id})
             _cancel_order(order_id)
             _discord(
-                f'⚠️ Partial fill on condor entry order — cancelled. '
+                f'⚠️ Partial fill on spread entry order — cancelled. '
                 f'Check Alpaca for any open legs that need manual closing.'
             )
             return False
@@ -1771,17 +1686,14 @@ def _attempt_entry(pos_state, weekly, now_str, ticker,
 
 # ── POSITION MONITORING ────────────────────────────────────────────────────────
 
-def _record_exit(pos_state, weekly, pos, reason, put_close_cost, call_close_cost, now_str):
+def _record_exit(pos_state, weekly, pos, reason, close_cost, now_str):
     """
     Log exit, update weekly_realized_loss, fire Discord.
-    Does NOT remove pos from pos_state — caller handles that and saves both files.
-    Mirrors credit_spread_strat.py's _record_exit; pnl combines both legs.
+    Does NOT remove pos from pos_state — caller handles that and saves both.
     """
-    put_credit  = pos['put_credit']
-    call_credit = pos['call_credit']
-    pnl = round((put_credit - put_close_cost + call_credit - call_close_cost) * 100, 2)
-    tkr = pos.get('ticker', 'SPY')
-    label = _pos_label(pos)
+    credit  = pos['credit']
+    pnl     = round((credit - close_cost) * 100, 2)
+    label   = f'SPY {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P {pos["expiration"]}'
 
     old_loss = weekly.get('weekly_realized_loss', 0.0)
     new_loss = round(max(0.0, old_loss - pnl), 2)
@@ -1791,36 +1703,30 @@ def _record_exit(pos_state, weekly, pos, reason, put_close_cost, call_close_cost
         'timestamp':            now_str,
         'type':                 'CLOSE',
         'event':                'EXIT',
-        'reason':                reason,
-        'label':                 label,
-        'short_put_symbol':      pos['short_put_symbol'],
-        'long_put_symbol':       pos['long_put_symbol'],
-        'short_call_symbol':     pos['short_call_symbol'],
-        'long_call_symbol':      pos['long_call_symbol'],
-        'expiration':            pos['expiration'],
-        'put_credit':            put_credit,
-        'call_credit':           call_credit,
-        'put_close_cost':        put_close_cost,
-        'call_close_cost':       call_close_cost,
-        'pnl':                   pnl,
-        'weekly_realized_loss':  new_loss,
+        'reason':               reason,
+        'label':                label,
+        'short_symbol':         pos['short_symbol'],
+        'long_symbol':          pos['long_symbol'],
+        'expiration':           pos['expiration'],
+        'credit':               credit,
+        'close_cost':           close_cost,
+        'pnl':                  pnl,
+        'weekly_realized_loss': new_loss,
     }
     _log(exit_entry)
     _log_trade(exit_entry)
 
     reason_labels = {
         'PROFIT_TARGET': 'profit target',
-        'PUT_STOP':      'put-side stop',
-        'CALL_STOP':     'call-side stop',
-        'EXPIRATION':    'expiration close',
+        'STOP_LOSS':     'stop loss',
+        'FORCE_CLOSE':   'force close 3:45pm',
     }
     pnl_str = f'+${pnl:.2f}' if pnl >= 0 else f'-${abs(pnl):.2f}'
     _discord(
-        f'{"✅" if pnl >= 0 else "🔴"} CONDOR CLOSED '
+        f'{"✅" if pnl >= 0 else "🔴"} SPREAD CLOSED '
         f'({reason_labels.get(reason, reason)}) | '
         f'{label} | '
-        f'Credit: ${put_credit + call_credit:.2f}  '
-        f'Close: put ${put_close_cost:.4f} / call ${call_close_cost:.4f} | '
+        f'Credit: ${credit:.2f}  Close: ${close_cost:.4f} | '
         f'P&L: {pnl_str} | '
         f'Week loss: ${new_loss:.2f} / ${WEEKLY_LOSS_LIMIT:.0f}'
     )
@@ -1838,12 +1744,13 @@ def _record_exit(pos_state, weekly, pos, reason, put_close_cost, call_close_cost
 
 def _monitor_positions(pos_state, weekly, now_str):
     """
-    Check all open condors for profit target / either-leg stop / expiration close.
-    Mode A behavior: the WHOLE condor closes if EITHER leg's cost reaches 200% of
-    its OWN credit, OR the combined (put+call) cost reaches 50% of combined credit.
-    ACTIVE-gated. Same pending-close verification, stale-price fallback, and
-    expiry force-close structure as credit_spread_strat.py's _monitor_positions —
-    adapted for 4-leg positions and two independent stop thresholds.
+    Check all open positions for profit target / stop loss / 3:45pm force
+    close. ACTIVE-gated. Modifies pos_state['positions'] in place; saves both
+    files on any change.
+
+    Force close takes priority over a still-pending profit-target limit order,
+    same way a fresh stop-loss reading does — both cancel the pending limit
+    and place a market order instead.
     """
     if not ACTIVE:
         return
@@ -1852,37 +1759,32 @@ def _monitor_positions(pos_state, weekly, now_str):
     if not positions:
         return
 
-    today             = datetime.now(ET).date()
-    now_et            = datetime.now(ET)
     to_close          = []
     positions_updated = False
 
     for pos in positions:
-        if pos.get('reconciled') and pos.get('short_put_symbol') == 'UNKNOWN':
-            print(f'  [monitor] Skipping untracked reconciled condor — manual review required')
+        if pos.get('reconciled') and pos.get('short_symbol') == 'UNKNOWN':
+            print(f'  [monitor] Skipping untracked reconciled position — manual review required')
             continue
 
-        sp, lp = pos['short_put_symbol'], pos['long_put_symbol']
-        sc, lc = pos['short_call_symbol'], pos['long_call_symbol']
-        expiry = date.fromisoformat(pos['expiration'])
-        label  = _pos_label(pos)
-        leg_key = (sp, lp, sc, lc)
+        short_sym = pos['short_symbol']
+        long_sym  = pos['long_symbol']
+        credit    = pos['credit']
+        label     = f'SPY {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P {pos["expiration"]}'
 
         try:
-            # ── Check pending close order (profit-target limit) ────────────────
+            # ── Check pending profit-target close order ────────────────────────
             pending_id = pos.get('pending_close_order_id')
             if pending_id:
                 order    = _get_order(pending_id)
                 o_status = order.get('status', '') if order else ''
 
                 if o_status == 'filled':
-                    put_cost, call_cost = _leg_close_costs_from_order(order, pos)
-                    print(f'  {label}: pending close CONFIRMED FILLED '
-                          f'(put=${put_cost:.4f} call=${call_cost:.4f})')
+                    fill_cost = float(order['filled_avg_price'])
+                    print(f'  {label}: pending close CONFIRMED FILLED (cost=${fill_cost:.4f})')
                     _log({'timestamp': now_str, 'event': 'PROFIT_TARGET_CLOSE_CONFIRMED',
-                          'label': label, 'order_id': pending_id,
-                          'put_close_cost': put_cost, 'call_close_cost': call_cost})
-                    _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET', put_cost, call_cost, now_str)
+                          'label': label, 'order_id': pending_id, 'fill_cost': fill_cost})
+                    _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET', fill_cost, now_str)
                     to_close.append(pos)
                     continue
 
@@ -1897,15 +1799,11 @@ def _monitor_positions(pos_state, weekly, now_str):
                     )
                     pos['pending_close_order_id'] = None
                     positions_updated = True
-                    put_cost  = _current_cost_to_close(sp, lp)
-                    call_cost = _current_cost_to_close(sc, lc)
-                    if put_cost is None:
-                        put_cost = pos['put_credit'] * PROFIT_TARGET_PCT
-                    if call_cost is None:
-                        call_cost = pos['call_credit'] * PROFIT_TARGET_PCT
-                    retry_ok = _place_close_order(sp, lp, sc, lc, order_type='market')
+                    curr_cost = _current_cost_to_close(short_sym, long_sym) or pos['profit_target']
+                    retry_ok  = _place_close_order(short_sym, long_sym, order_type='market')
                     if retry_ok:
-                        _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET', put_cost, call_cost, now_str)
+                        fill_cost = _verify_close_fill(retry_ok, curr_cost, label, now_str)
+                        _record_exit(pos_state, weekly, pos, 'PROFIT_TARGET', fill_cost, now_str)
                         to_close.append(pos)
                     else:
                         _discord(
@@ -1914,28 +1812,41 @@ def _monitor_positions(pos_state, weekly, now_str):
                         )
                     continue
 
-                # Order still open/pending — check either stop before waiting
-                put_check  = _current_cost_to_close(sp, lp)
-                call_check = _current_cost_to_close(sc, lc)
-                put_stop_hit  = put_check  is not None and put_check  >= pos['put_stop_cost']
-                call_stop_hit = call_check is not None and call_check >= pos['call_stop_cost']
-                if put_stop_hit or call_stop_hit:
-                    stop_reason = 'PUT_STOP' if put_stop_hit else 'CALL_STOP'
-                    print(f'  {label}: {stop_reason} overrides pending profit-target close')
+                # Force close overrides a still-pending profit-target order
+                if _is_force_close_time():
+                    print(f'  {label}: FORCE CLOSE overrides pending profit-target order')
                     _cancel_order(pending_id)
                     pos['pending_close_order_id'] = None
                     positions_updated = True
-                    ok = _place_close_order(sp, lp, sc, lc, order_type='market')
+                    cost = _current_cost_to_close(short_sym, long_sym) or 0.0
+                    ok   = _place_close_order(short_sym, long_sym, order_type='market')
                     if ok:
-                        pc = put_check if put_check is not None else pos['put_credit']
-                        cc = call_check if call_check is not None else pos['call_credit']
-                        fill_put, fill_call = _verify_close_fill(ok, pos, pc, cc, label, now_str)
-                        _record_exit(pos_state, weekly, pos, stop_reason, fill_put, fill_call, now_str)
+                        fill_cost = _verify_close_fill(ok, cost, label, now_str)
+                        _record_exit(pos_state, weekly, pos, 'FORCE_CLOSE', fill_cost, now_str)
+                        to_close.append(pos)
+                    else:
+                        _discord(
+                            f'🚨 FORCE CLOSE FAILED (after cancelling pending profit-target) | '
+                            f'{label} | Manual close required in Alpaca immediately.'
+                        )
+                    continue
+
+                # Order still open/pending — check stop-loss override before waiting
+                curr_cost_check = _current_cost_to_close(short_sym, long_sym)
+                if curr_cost_check is not None and curr_cost_check >= pos['stop_loss_cost']:
+                    print(f'  {label}: STOP LOSS overrides pending profit-target close')
+                    _cancel_order(pending_id)
+                    pos['pending_close_order_id'] = None
+                    positions_updated = True
+                    ok = _place_close_order(short_sym, long_sym, order_type='market')
+                    if ok:
+                        fill_cost = _verify_close_fill(ok, curr_cost_check, label, now_str)
+                        _record_exit(pos_state, weekly, pos, 'STOP_LOSS', fill_cost, now_str)
                         to_close.append(pos)
                     else:
                         _log({'timestamp': now_str, 'event': 'CLOSE_ORDER_FAILED',
-                              'label': label, 'reason': stop_reason})
-                        _discord(f'⚠️ Close order failed | {label} | {stop_reason} | Retrying next scan')
+                              'label': label, 'reason': 'STOP_LOSS'})
+                        _discord(f'⚠️ Close order failed | {label} | Stop loss | Retrying next scan')
                     continue
 
                 if order is None:
@@ -1944,84 +1855,73 @@ def _monitor_positions(pos_state, weekly, now_str):
                     print(f'  {label}: pending close {pending_id[:8]}… still {o_status} — waiting')
                 continue
 
-            # ── Expiration force-close (9:45am ET on expiry day) ─────────────
-            if today == expiry and now_et.hour == 9 and now_et.minute >= 45:
-                print(f'  {label}: EXPIRATION CLOSE')
-                put_cost  = _current_cost_to_close(sp, lp) or 0.0
-                call_cost = _current_cost_to_close(sc, lc) or 0.0
-                ok = _place_close_order(sp, lp, sc, lc, order_type='market')
+            # ── 3:45pm force close ──────────────────────────────────────────────
+            if _is_force_close_time():
+                print(f'  {label}: FORCE CLOSE (3:45pm)')
+                cost = _current_cost_to_close(short_sym, long_sym)
+                if cost is None:
+                    cost = 0.0
+                    print(f'  {label}: cost unavailable for force close — using 0.0')
+                ok = _place_close_order(short_sym, long_sym, order_type='market')
                 if ok:
-                    _record_exit(pos_state, weekly, pos, 'EXPIRATION', put_cost, call_cost, now_str)
+                    fill_cost = _verify_close_fill(ok, cost, label, now_str)
+                    _record_exit(pos_state, weekly, pos, 'FORCE_CLOSE', fill_cost, now_str)
                     to_close.append(pos)
-                    _log({'timestamp': now_str, 'event': 'MONITOR_EXPIRY_CLOSE',
-                          'label': label, 'put_close_cost': put_cost, 'call_close_cost': call_cost})
                 else:
-                    print(f'  {label}: EXPIRY CLOSE ORDER FAILED')
+                    print(f'  {label}: FORCE CLOSE ORDER FAILED')
                     _log({'timestamp': now_str, 'event': 'CLOSE_ORDER_FAILED',
-                          'label': label, 'reason': 'EXPIRATION'})
+                          'label': label, 'reason': 'FORCE_CLOSE'})
                     _discord(
-                        f'🚨 CLOSE ORDER FAILED | {label} | EXPIRATION DAY | '
-                        f'Manual close required in Alpaca immediately.'
+                        f'🚨 FORCE CLOSE FAILED | {label} | '
+                        f'Manual close required in Alpaca immediately — expires today.'
                     )
                 continue
 
-            # ── Current spread values (put side, call side) ───────────────────
-            put_cost  = _current_cost_to_close(sp, lp)
-            call_cost = _current_cost_to_close(sc, lc)
-
-            if put_cost is None or call_cost is None:
-                fail_count = _monitor_consec_fail.get(leg_key, 0) + 1
-                _monitor_consec_fail[leg_key] = fail_count
-                cached = _last_known_cost.get(leg_key)
-                stale_put = stale_call = stale_age_min = None
+            # ── Current spread value ──────────────────────────────────────────
+            _cost_key = (short_sym, long_sym)
+            cost = _current_cost_to_close(short_sym, long_sym)
+            if cost is None:
+                fail_count = _monitor_consec_fail.get(_cost_key, 0) + 1
+                _monitor_consec_fail[_cost_key] = fail_count
+                cached = _last_known_cost.get(_cost_key)
+                stale_cost = stale_age_min = None
                 if cached:
                     stale_age_min = (datetime.now(ET) - cached['ts']).total_seconds() / 60
                     if stale_age_min <= STALE_COST_MAX_MINUTES:
-                        stale_put  = cached['put_cost']
-                        stale_call = cached['call_cost']
+                        stale_cost = cached['cost']
                 age_str = f'{stale_age_min:.0f}min ago' if stale_age_min is not None else 'never'
                 print(f'  {label}: value unavailable — skipping this cycle '
                       f'({fail_count} consecutive; last good: {age_str})')
                 _log({'timestamp': now_str, 'event': 'MONITOR_VALUE_UNAVAILABLE',
                       'label': label, 'consecutive_failures': fail_count,
-                      'stale_put_cost': stale_put, 'stale_call_cost': stale_call,
+                      'stale_cost': stale_cost,
                       'stale_age_min': round(stale_age_min, 1) if stale_age_min is not None else None})
-                if fail_count >= MONITOR_ALERT_THRESHOLD and leg_key not in _monitor_alert_sent:
-                    _monitor_alert_sent.add(leg_key)
+                if fail_count >= MONITOR_ALERT_THRESHOLD and _cost_key not in _monitor_alert_sent:
+                    _monitor_alert_sent.add(_cost_key)
                     _discord(
                         f'⚠️ STOP-LOSS MONITORING DEGRADED | {label} | '
-                        f'{fail_count} consecutive pricing failures (~{fail_count * 5} min). '
+                        f'{fail_count} consecutive pricing failures. '
                         f'Last good price: {age_str}. '
-                        f'Stops at put ${pos["put_stop_cost"]:.2f} / call ${pos["call_stop_cost"]:.2f} '
+                        f'Stop at ${pos["stop_loss_cost"]:.2f} (150% of credit ${credit:.2f}) '
                         f'cannot be auto-enforced. Manual monitoring required.'
                     )
-                # Use whichever side has a usable value (live or stale-within-window);
-                # if EITHER side clears its own stop, close the whole condor.
-                eff_put  = put_cost  if put_cost  is not None else stale_put
-                eff_call = call_cost if call_cost is not None else stale_call
-                put_stop_hit  = eff_put  is not None and eff_put  >= pos['put_stop_cost']
-                call_stop_hit = eff_call is not None and eff_call >= pos['call_stop_cost']
-                if put_stop_hit or call_stop_hit:
-                    stop_reason = 'PUT_STOP' if put_stop_hit else 'CALL_STOP'
-                    print(f'  {label}: STALE-PRICE {stop_reason} '
-                          f'(put={eff_put} call={eff_call} from {stale_age_min:.0f}min ago)'
-                          if stale_age_min is not None else
-                          f'  {label}: {stop_reason} on partially-live pricing')
+                if stale_cost is not None and stale_cost >= pos['stop_loss_cost']:
+                    print(f'  {label}: STALE-PRICE STOP LOSS '
+                          f'(cached {stale_cost:.4f} from {stale_age_min:.0f}min ago '
+                          f'>= stop {pos["stop_loss_cost"]:.4f})')
                     _log({'timestamp': now_str, 'event': 'MONITOR_STALE_STOP_LOSS',
-                          'label': label, 'stop_reason': stop_reason,
-                          'stale_put_cost': eff_put, 'stale_call_cost': eff_call,
-                          'stale_age_min': round(stale_age_min, 1) if stale_age_min is not None else None})
+                          'label': label, 'stale_cost': stale_cost,
+                          'stale_age_min': round(stale_age_min, 1)})
                     _discord(
-                        f'⚠️ STOP-LOSS TRIGGERED ON STALE/PARTIAL PRICE | {label} | '
-                        f'{stop_reason} — put ${eff_put or 0:.4f} / call ${eff_call or 0:.4f} '
-                        f'vs stops put ${pos["put_stop_cost"]:.4f} / call ${pos["call_stop_cost"]:.4f}. '
+                        f'⚠️ STOP-LOSS TRIGGERED ON STALE PRICE | {label} | '
+                        f'Live quotes unavailable; cached cost ${stale_cost:.4f} '
+                        f'({stale_age_min:.0f}min old) ≥ stop ${pos["stop_loss_cost"]:.4f}. '
                         f'Placing market close order.'
                     )
-                    ok = _place_close_order(sp, lp, sc, lc, order_type='market')
+                    ok = _place_close_order(short_sym, long_sym, order_type='market')
                     if ok:
-                        fill_put, fill_call = _verify_close_fill(
-                            ok, pos, eff_put or 0.0, eff_call or 0.0, label, now_str)
-                        _record_exit(pos_state, weekly, pos, stop_reason, fill_put, fill_call, now_str)
+                        fill_cost = _verify_close_fill(ok, stale_cost, label, now_str)
+                        _record_exit(pos_state, weekly, pos, 'STOP_LOSS', fill_cost, now_str)
                         to_close.append(pos)
                     else:
                         _discord(
@@ -2030,20 +1930,17 @@ def _monitor_positions(pos_state, weekly, now_str):
                         )
                 continue
 
-            # Update last-known-good cache and reset failure counters on success
-            _last_known_cost[leg_key] = {'put_cost': put_cost, 'call_cost': call_cost, 'ts': datetime.now(ET)}
-            _monitor_consec_fail[leg_key] = 0
-            _monitor_alert_sent.discard(leg_key)
+            _last_known_cost[_cost_key] = {'cost': cost, 'ts': datetime.now(ET)}
+            _monitor_consec_fail[_cost_key] = 0
+            _monitor_alert_sent.discard(_cost_key)
 
-            combined_cost = round(put_cost + call_cost, 4)
-            print(f'  {label}: put_cost={put_cost:.4f}  call_cost={call_cost:.4f}  '
-                  f'combined={combined_cost:.4f}  tgt≤{pos["profit_target"]:.4f}  '
-                  f'put_stop≥{pos["put_stop_cost"]:.4f}  call_stop≥{pos["call_stop_cost"]:.4f}')
+            print(f'  {label}: cost={cost:.4f}  credit={credit:.4f}  '
+                  f'tgt≤{pos["profit_target"]:.4f}  stop≥{pos["stop_loss_cost"]:.4f}')
 
-            # ── Profit target: combined cost ≤ 50% of combined credit ────────
-            if combined_cost <= pos['profit_target']:
+            # ── Profit target: cost ≤ 50% of original credit ─────────────────
+            if cost <= pos['profit_target']:
                 print(f'  {label}: PROFIT TARGET')
-                order_id = _place_close_order(sp, lp, sc, lc,
+                order_id = _place_close_order(short_sym, long_sym,
                                               order_type='limit',
                                               limit_price=pos['profit_target'])
                 if order_id:
@@ -2059,22 +1956,19 @@ def _monitor_positions(pos_state, weekly, now_str):
                     _discord(f'⚠️ Close order failed | {label} | Profit target | Retrying next scan')
                 continue
 
-            # ── Either-leg stop: put_cost ≥ 200% of put credit, OR call_cost ≥ 200% of call credit ──
-            put_stop_hit  = put_cost  >= pos['put_stop_cost']
-            call_stop_hit = call_cost >= pos['call_stop_cost']
-            if put_stop_hit or call_stop_hit:
-                stop_reason = 'PUT_STOP' if put_stop_hit else 'CALL_STOP'
-                print(f'  {label}: {stop_reason}')
-                ok = _place_close_order(sp, lp, sc, lc, order_type='market')
+            # ── Stop loss: cost ≥ 150% of original credit ────────────────────
+            if cost >= pos['stop_loss_cost']:
+                print(f'  {label}: STOP LOSS')
+                ok = _place_close_order(short_sym, long_sym, order_type='market')
                 if ok:
-                    fill_put, fill_call = _verify_close_fill(ok, pos, put_cost, call_cost, label, now_str)
-                    _record_exit(pos_state, weekly, pos, stop_reason, fill_put, fill_call, now_str)
+                    fill_cost = _verify_close_fill(ok, cost, label, now_str)
+                    _record_exit(pos_state, weekly, pos, 'STOP_LOSS', fill_cost, now_str)
                     to_close.append(pos)
                 else:
-                    print(f'  {label}: {stop_reason} close failed — retrying next cycle')
+                    print(f'  {label}: stop-loss close failed — retrying next cycle')
                     _log({'timestamp': now_str, 'event': 'CLOSE_ORDER_FAILED',
-                          'label': label, 'reason': stop_reason})
-                    _discord(f'⚠️ Close order failed | {label} | {stop_reason} | Retrying next scan')
+                          'label': label, 'reason': 'STOP_LOSS'})
+                    _discord(f'⚠️ Close order failed | {label} | Stop loss | Retrying next scan')
 
         except Exception as e:
             print(f'  {label}: MONITOR ERROR — {type(e).__name__}: {e}')
@@ -2096,6 +1990,10 @@ def _monitor_positions(pos_state, weekly, now_str):
 # ── MACRO EVENT FILTER ─────────────────────────────────────────────────────────
 
 def _macro_event_today():
+    """
+    Return an event name string if today (ET) is a blocked macro event day, else None.
+    Checked before all other entry conditions — no API calls required.
+    """
     today = datetime.now(ET).date()
     today_str = today.isoformat()
 
@@ -2116,24 +2014,23 @@ def _macro_event_today():
 
 # ── ENTRY CONDITIONS ───────────────────────────────────────────────────────────
 
-_entry_blocked_alert_sent = False   # dedup: alert once per outage, not every scan
+_entry_blocked_alert_sent = False
 
 
-def _check_entry_conditions(ticker, pos_state, weekly):
-    """Evaluate all gates cheapest-first. Same structure/order as credit_spread_strat.py."""
+def _check_entry_conditions(pos_state, weekly):
+    """
+    Evaluate all gates cheapest-first. Short-circuits on first group failure.
+    Returns (all_passed: bool, conditions: dict, spy_px, ivr, vix).
+    """
     global _entry_blocked_alert_sent
-    conds    = {}
-    stock_px = ivr = vix = None
+    conds  = {}
+    spy_px = ivr = vix = None
 
     def _c(name, passed, detail):
         conds[name] = {'passed': bool(passed), 'detail': str(detail)}
 
     # Hard guard: never evaluate or pass ANY gate on state loaded via the
-    # degraded fallback path (see _load_positions()/_load_weekly()). The
-    # 2026-08-26 fix stops a DB outage from corrupting saved state, but that
-    # alone doesn't stop the bot from placing a real order while it can't
-    # trust its own picture of open positions or cooldown status — this
-    # closes that entry-side gap.
+    # degraded fallback path.
     if pos_state.get('_degraded') or weekly.get('_degraded'):
         _c('degraded_state', False,
            'pos_state or weekly loaded from degraded fallback — refusing to trade')
@@ -2145,50 +2042,47 @@ def _check_entry_conditions(ticker, pos_state, weekly):
             _log({'timestamp': datetime.now(ET).strftime('%Y-%m-%d %H:%M ET'),
                   'event': 'ENTRY_BLOCKED_DEGRADED_STATE'})
             _discord(msg)
-        return False, conds, stock_px, ivr, vix
-    _entry_blocked_alert_sent = False   # state is healthy — re-arm for next time
+        return False, conds, spy_px, ivr, vix
+    _entry_blocked_alert_sent = False
 
     macro = _macro_event_today()
     _c('macro_event', macro is None, macro or 'none')
     if macro:
-        return False, conds, stock_px, ivr, vix
+        return False, conds, spy_px, ivr, vix
 
-    _c('active',          ACTIVE, 'True' if ACTIVE else 'False — DORMANT')
-    _c('entry_window',    _in_entry_window(), '9:45–3:30 ET')
+    _c('active',          ACTIVE,
+       'True' if ACTIVE else 'False — DORMANT')
+    _c('entry_window',    _in_entry_window(),
+       '9:45–11:00 ET')
     _c('position_limit',  len(pos_state.get('positions', [])) < MAX_POSITIONS,
        f'{len(pos_state.get("positions", []))}/{MAX_POSITIONS} open')
     _c('weekly_cooldown', not weekly.get('cooldown_active', False),
        f'loss=${weekly.get("weekly_realized_loss", 0):.2f} / ${WEEKLY_LOSS_LIMIT:.0f}')
 
     if not all(v['passed'] for v in conds.values()):
-        return False, conds, stock_px, ivr, vix
+        return False, conds, spy_px, ivr, vix
 
-    # Underwater gate: with 1 open condor, block a 2nd if either alive leg is underwater
+    # Underwater position gate — don't add a second spread if the first is at a loss
     real_pos = [p for p in pos_state.get('positions', [])
-                if not (p.get('reconciled') and p.get('short_put_symbol') == 'UNKNOWN')]
+                if not (p.get('reconciled') and p.get('short_symbol') == 'UNKNOWN')]
     if len(real_pos) == 1:
-        p = real_pos[0]
-        put_cost  = _current_cost_to_close(p['short_put_symbol'], p['long_put_symbol'])
-        call_cost = _current_cost_to_close(p['short_call_symbol'], p['long_call_symbol'])
-        put_underwater  = put_cost  is not None and put_cost  > p.get('put_credit', 0)
-        call_underwater = call_cost is not None and call_cost > p.get('call_credit', 0)
-        if put_underwater or call_underwater:
+        p    = real_pos[0]
+        cost = _current_cost_to_close(p['short_symbol'], p['long_symbol'])
+        if cost is not None and cost > p.get('credit', 0):
             _c('underwater_block', False,
-               f'put_cost={put_cost}  call_cost={call_cost}')
-            return False, conds, stock_px, ivr, vix
+               f'cost={cost:.4f} > credit={p.get("credit", 0):.4f}')
+            return False, conds, spy_px, ivr, vix
 
-    above_sma, stock_close, sma_val = _above_sma20(ticker)
-    stock_px = stock_close
-    sma_key  = f'{ticker.lower()}_above_sma'
+    above_sma, spy_close, sma_val = _above_sma20()
+    spy_px = spy_close
     if above_sma is None:
-        _c(sma_key, False, 'data unavailable')
+        _c('spy_above_sma', False, 'data unavailable')
     else:
-        _c(sma_key, above_sma,
-           f'{ticker}={stock_close:.2f}  SMA20={sma_val:.2f}  '
-           f'{"above" if above_sma else "BELOW"}')
+        _c('spy_above_sma', above_sma,
+           f'SPY={spy_close:.2f}  SMA20={sma_val:.2f}  {"above" if above_sma else "BELOW"}')
 
     if not all(v['passed'] for v in conds.values()):
-        return False, conds, stock_px, ivr, vix
+        return False, conds, spy_px, ivr, vix
 
     ivr, vix = _spy_ivrank()
     if ivr is None:
@@ -2200,98 +2094,76 @@ def _check_entry_conditions(ticker, pos_state, weekly):
         _c('vix_cap',  vix < MAX_VIX,
            f'SPY IV={vix:.1f}% {"<" if vix < MAX_VIX else "≥"} {MAX_VIX:.0f}%')
 
-    return all(v['passed'] for v in conds.values()), conds, stock_px, ivr, vix
+    return all(v['passed'] for v in conds.values()), conds, spy_px, ivr, vix
 
 
-def _evaluate_ticker(ticker, pos_state, weekly, now_str):
+# ── SIGNAL EVALUATION ──────────────────────────────────────────────────────────
+
+def _evaluate_entry(pos_state, weekly, now_str):
     """
-    Full entry evaluation for one ticker. Returns (signal_dict | None, conditions_dict).
-    Requires BOTH a valid 20-delta short put AND a valid 20-delta short call, each
-    meeting MIN_CREDIT_LEG independently — matches backtest_iron_condor.py exactly.
+    Full entry evaluation. Returns (signal_dict | None, conditions_dict).
+    signal_dict has keys: expiry, short_sym, long_sym, short_strike, long_strike,
+                          short_delta, credit, spy_px, ivr, vix.
     """
-    passed, conds, stock_px, ivr, vix = _check_entry_conditions(ticker, pos_state, weekly)
+    passed, conds, spy_px, ivr, vix = _check_entry_conditions(pos_state, weekly)
     if not passed:
         return None, conds
 
-    expiry = _find_target_expiration(ticker)
+    expiry = _find_today_expiration()
     if expiry is None:
-        conds['expiry_found'] = {'passed': False, 'detail': 'no valid expiration found'}
+        conds['expiry_found'] = {'passed': False, 'detail': 'no 0DTE expiry today'}
         return None, conds
-    dte = (expiry - date.today()).days
-    conds['expiry_found'] = {'passed': True, 'detail': f'{expiry} ({dte} DTE)'}
+    conds['expiry_found'] = {'passed': True, 'detail': expiry.isoformat()}
 
-    chain = _fetch_combined_chain(ticker, expiry, now_str)
+    chain = _fetch_0dte_chain(expiry, now_str)
     if chain is None:
         conds['chain_fetched'] = {'passed': False,
                                    'detail': 'chain unavailable (see CHAIN_* log event)'}
         return None, conds
     conds['chain_fetched'] = {'passed': True, 'detail': f'{len(chain)} contracts'}
 
-    short_put, short_put_strike, short_put_delta = _find_short_put_strike(
-        chain, stock_px, expiry, vix, now_str
-    )
-    short_call, short_call_strike, short_call_delta = _find_short_call_strike(
-        chain, stock_px, expiry, vix, now_str
-    )
-    if short_put is None or short_call is None:
-        conds['short_strikes'] = {
-            'passed': False,
-            'detail': f'put={"ok" if short_put else "MISSING"}  call={"ok" if short_call else "MISSING"}',
-        }
+    short_sym, short_strike, short_delta = _find_short_strike(chain, spy_px, vix, now_str)
+    if short_sym is None:
+        conds['short_strike'] = {'passed': False,
+                                  'detail': 'no suitable 25-30Δ put (see CHAIN_* log)'}
         return None, conds
-    conds['short_strikes'] = {
-        'passed': True,
-        'detail': f'put ${short_put_strike:.0f} Δ{short_put_delta:.3f}  '
-                  f'call ${short_call_strike:.0f} Δ{short_call_delta:.3f}',
-    }
+    conds['short_strike'] = {'passed': True,
+                              'detail': f'${short_strike:.0f}  delta={short_delta:.3f}'}
 
-    long_put, long_put_strike = _find_long_put_symbol(chain, short_put_strike)
-    long_call, long_call_strike = _find_long_call_symbol(chain, short_call_strike)
-    if long_put is None or long_call is None:
-        conds['long_strikes'] = {'passed': False, 'detail': 'not found in chain'}
+    long_sym, long_strike = _find_long_symbol(chain, short_strike)
+    if long_sym is None:
+        conds['long_strike'] = {'passed': False, 'detail': 'not found in chain'}
         return None, conds
-    conds['long_strikes'] = {'passed': True,
-                              'detail': f'put ${long_put_strike:.0f}  call ${long_call_strike:.0f}'}
+    conds['long_strike'] = {'passed': True, 'detail': f'${long_strike:.0f}'}
 
-    put_credit  = _spread_mid(chain, short_put, long_put)
-    call_credit = _spread_mid(chain, short_call, long_call)
-    if put_credit is None or call_credit is None or \
-       put_credit < MIN_CREDIT_LEG or call_credit < MIN_CREDIT_LEG:
+    credit = _spread_mid(chain, short_sym, long_sym)
+    if credit is None or credit < MIN_CREDIT:
         conds['min_credit'] = {
             'passed': False,
-            'detail': f'put=${put_credit}  call=${call_credit}  (need ≥${MIN_CREDIT_LEG} each)',
+            'detail': (f'credit=${credit:.4f} < ${MIN_CREDIT}'
+                       if credit is not None else 'mid unavailable'),
         }
         return None, conds
-    conds['min_credit'] = {'passed': True,
-                            'detail': f'put=${put_credit:.4f}  call=${call_credit:.4f}'}
+    conds['min_credit'] = {'passed': True, 'detail': f'credit=${credit:.4f}'}
 
     return {
-        'ticker':             ticker,
-        'expiry':              expiry,
-        'short_put':            short_put,
-        'long_put':             long_put,
-        'short_call':           short_call,
-        'long_call':            long_call,
-        'short_put_strike':     short_put_strike,
-        'long_put_strike':      long_put_strike,
-        'short_call_strike':    short_call_strike,
-        'long_call_strike':     long_call_strike,
-        'short_put_delta':      short_put_delta,
-        'short_call_delta':     short_call_delta,
-        'put_credit':           put_credit,
-        'call_credit':          call_credit,
-        'stock_px':             stock_px,
-        'ivr':                  ivr,
-        'vix':                  vix,
+        'expiry':       expiry,
+        'short_sym':    short_sym,
+        'long_sym':     long_sym,
+        'short_strike': short_strike,
+        'long_strike':  long_strike,
+        'short_delta':  short_delta,
+        'credit':       credit,
+        'spy_px':       spy_px,
+        'ivr':          ivr,
+        'vix':          vix,
     }, conds
 
 
 # ── DAILY SUMMARY ──────────────────────────────────────────────────────────────
 
 def _check_daily_summary(pos_state, weekly, now_str):
-    """Send once-daily summary at 3:35pm ET. ACTIVE-gated. Same dedup pattern
-    (DB-first, then JSON, to survive a DB-write-failure/JSON-fallback split
-    brain) as credit_spread_strat.py."""
+    """Send once-daily summary at 3:50pm ET. ACTIVE-gated."""
     if not ACTIVE:
         return
     today_str = datetime.now(ET).date().isoformat()
@@ -2317,10 +2189,10 @@ def _check_daily_summary(pos_state, weekly, now_str):
     pos_state['daily_summary_sent'] = today_str
     _save_positions(pos_state)
 
-    positions = pos_state.get('positions', [])
-    real_pos  = [p for p in positions
-                 if not (p.get('reconciled') and p.get('short_put_symbol') == 'UNKNOWN')]
-    week_loss = weekly.get('weekly_realized_loss', 0.0)
+    positions  = pos_state.get('positions', [])
+    real_pos   = [p for p in positions
+                  if not (p.get('reconciled') and p.get('short_symbol') == 'UNKNOWN')]
+    week_loss  = weekly.get('weekly_realized_loss', 0.0)
 
     try:
         with open(TRADE_LOG_FILE) as f:
@@ -2334,74 +2206,45 @@ def _check_daily_summary(pos_state, weekly, now_str):
         realized_pnl  = sum(t.get('pnl', 0) for t in today_closes)
         entries_today = len(today_opens)
         exits_today   = len(today_closes)
+        wins   = sum(1 for t in today_closes if t.get('pnl', 0) > 0)
+        losses = exits_today - wins
     except Exception:
-        realized_pnl = entries_today = exits_today = 0
+        realized_pnl = entries_today = exits_today = wins = losses = 0
 
-    unrealized_pnl = 0.0
-    pos_costs: dict = {}
-    for pos in real_pos:
-        sp, lp = pos.get('short_put_symbol', ''), pos.get('long_put_symbol', '')
-        sc, lc = pos.get('short_call_symbol', ''), pos.get('long_call_symbol', '')
-        put_cost  = _current_cost_to_close(sp, lp)  if sp and lp else None
-        call_cost = _current_cost_to_close(sc, lc)  if sc and lc else None
-        pos_costs[id(pos)] = (put_cost, call_cost)
-        if put_cost is not None:
-            unrealized_pnl += round((pos.get('put_credit', 0) - put_cost) * 100, 2)
-        if call_cost is not None:
-            unrealized_pnl += round((pos.get('call_credit', 0) - call_cost) * 100, 2)
-
-    alpaca_note = ''
-    try:
-        r = _alpaca_get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers())
-        if r is not None:
-            today_ymd = datetime.now(ET).strftime('%y%m%d')
-            other_legs = _other_strategy_leg_symbols()
-            tracked_legs = [p for p in r.json()
-                            if p.get('asset_class') == 'us_option'
-                            and any(str(p.get('symbol', '')).startswith(t) for t in TICKERS)
-                            and str(p.get('symbol', ''))[3:9] != today_ymd
-                            and p.get('symbol', '') not in other_legs]
-            alpaca_condors = len(tracked_legs) // 4
-            file_condors   = len(real_pos)
-            if alpaca_condors != file_condors:
-                alpaca_note = (f' ⚠️ Alpaca shows {len(tracked_legs)} leg(s) '
-                               f'({alpaca_condors} condor(s)) — state file has {file_condors}')
-            else:
-                alpaca_note = f' ✓ Alpaca confirms {len(tracked_legs)} leg(s)'
-    except Exception:
-        pass
-
+    # 0DTE always resolves same day — by the 3:50pm summary, real_pos should
+    # be empty except for a force-close that just failed and needs a human.
     pos_detail = ''
     for pos in real_pos:
-        put_cost, call_cost = pos_costs.get(id(pos), (None, None))
-        unr_bits = []
-        if put_cost is not None:
-            unr_bits.append(f'put ${round((pos.get("put_credit",0)-put_cost)*100,2):+.2f}')
-        if call_cost is not None:
-            unr_bits.append(f'call ${round((pos.get("call_credit",0)-call_cost)*100,2):+.2f}')
-        unr_str = ('  unreal ' + ' / '.join(unr_bits)) if unr_bits else ''
-        tkr = pos.get('ticker', 'SPY')
         pos_detail += (
-            f'\n  [{tkr}] {pos["short_put_strike"]:.0f}/{pos["long_put_strike"]:.0f}P '
-            f'{pos["short_call_strike"]:.0f}/{pos["long_call_strike"]:.0f}C '
-            f'exp={pos["expiration"]}  credit=${pos["total_credit"]:.2f}{unr_str}'
+            f'\n  ⚠️ STILL OPEN [needs manual attention]: '
+            f'{pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P '
+            f'credit=${pos["credit"]:.2f}'
         )
 
+    reason_str = f'wins: {wins}  losses: {losses}'
+    pnl_str    = f'+${realized_pnl:.2f}' if realized_pnl >= 0 else f'-${abs(realized_pnl):.2f}'
+
     _discord(
-        f'📊 **Iron Condor Daily Summary**\n'
-        f'Open positions: {len(real_pos)}{alpaca_note}{pos_detail}\n'
-        f'Entries today: {entries_today}  |  Exits today: {exits_today}\n'
-        f'Realized P&L: ${realized_pnl:+.2f}  |  Unrealized: ${unrealized_pnl:+.2f}\n'
+        f'📊 **0DTE-V2 Daily Summary**\n'
+        f'Entries today: {entries_today}  |  Exits today: {exits_today}  ({reason_str})\n'
+        f'Realized P&L: {pnl_str}{pos_detail}\n'
         f'Week-to-date loss: ${week_loss:.2f} / ${WEEKLY_LOSS_LIMIT:.0f} limit'
     )
+    _log({'timestamp': now_str, 'event': 'DAILY_SUMMARY_SENT', 'date': today_str,
+          'entries': entries_today, 'exits': exits_today, 'realized_pnl': realized_pnl})
 
 
 # ── MORNING VITALS ─────────────────────────────────────────────────────────────
 
 def _send_morning_vitals():
-    """Post a market-open snapshot to Discord once per trading day at 9:30 ET.
-    Same dedup/holiday-check pattern as credit_spread_strat.py."""
+    """
+    Post a market-open snapshot to Discord once per trading day at 9:30 ET.
+    Dedup flag: pos_state['morning_vitals_sent'] == today's date (stored in DB).
+    Holiday check: Alpaca /v2/calendar — skips silently if market is closed.
+    """
     if not ACTIVE:
+        return
+    if not _is_vitals_window():
         return
 
     today_str = datetime.now(ET).date().isoformat()
@@ -2437,15 +2280,12 @@ def _send_morning_vitals():
     now_et   = datetime.now(ET)
     date_str = now_et.strftime('%A %B %-d, %Y')
 
-    spy_above, spy_px, spy_sma = _above_sma20('SPY')
-
-    def _sma_line(ticker, px, sma, above):
-        if px is None or sma is None:
-            return f'{ticker}:  N/A'
-        status = '✅ Above' if above else '❌ Below'
-        return f'{ticker}:  ${px:.2f}  |  SMA20: ${sma:.2f}  |  {status}'
-
-    spy_line = _sma_line('SPY', spy_px, spy_sma, spy_above)
+    spy_above, spy_px, spy_sma = _above_sma20()
+    if spy_px is not None and spy_sma is not None:
+        status   = '✅ Above' if spy_above else '❌ Below'
+        spy_line = f'SPY:  ${spy_px:.2f}  |  SMA20: ${spy_sma:.2f}  |  {status}'
+    else:
+        spy_line = 'SPY:  N/A'
 
     ivr, vix = _spy_ivrank()
     if vix is not None:
@@ -2460,37 +2300,28 @@ def _send_morning_vitals():
         ivr_line = 'IVR:  N/A'
 
     macro = _macro_event_today()
-    if macro:
-        macro_line = f'MACRO: {macro}  |  ⚠️ Blocked'
-    else:
-        macro_line = 'MACRO: None scheduled  |  ✅ Clear'
+    macro_line = (f'MACRO: {macro}  |  ⚠️ Blocked' if macro
+                  else 'MACRO: None scheduled  |  ✅ Clear')
 
     real_pos = [p for p in pos_state.get('positions', [])
-                if not (p.get('reconciled') and p.get('short_put_symbol') == 'UNKNOWN')]
+                if not (p.get('reconciled') and p.get('short_symbol') == 'UNKNOWN')]
     pos_lines = f'OPEN POSITIONS: {len(real_pos)} of {MAX_POSITIONS}'
     for pos in real_pos:
-        tkr = pos.get('ticker', 'SPY')
-        put_cost  = _current_cost_to_close(pos.get('short_put_symbol', ''), pos.get('long_put_symbol', ''))
-        call_cost = _current_cost_to_close(pos.get('short_call_symbol', ''), pos.get('long_call_symbol', ''))
-        total_credit = pos.get('total_credit', 0)
-        if put_cost is not None and call_cost is not None and total_credit > 0:
-            combined = put_cost + call_cost
-            pct_str = f'  ({(total_credit - combined) / total_credit * 100:.0f}% to target)'
-        else:
-            pct_str = ''
-        cost_str = (f'put ${put_cost:.4f}/call ${call_cost:.4f}'
-                    if put_cost is not None and call_cost is not None else 'N/A')
+        credit = pos.get('credit', 0)
+        cost   = _current_cost_to_close(pos.get('short_symbol', ''), pos.get('long_symbol', ''))
+        pct_str  = f'  ({(credit - cost) / credit * 100:.0f}% to target)' if (cost is not None and credit > 0) else ''
+        cost_str = f'${cost:.4f}' if cost is not None else 'N/A'
         pos_lines += (
-            f'\n  [{tkr}] {pos["short_put_strike"]:.0f}/{pos["long_put_strike"]:.0f}P '
-            f'{pos["short_call_strike"]:.0f}/{pos["long_call_strike"]:.0f}C'
-            f'  exp {pos["expiration"]}'
-            f'  cost {cost_str} / credit ${total_credit:.2f}'
-            f'{pct_str}'
+            f'\n  {pos["short_strike"]:.0f}/{pos["long_strike"]:.0f}P'
+            f'  cost {cost_str} / credit ${credit:.2f}{pct_str}'
         )
 
     week_loss = weekly.get('weekly_realized_loss', 0.0)
     week_str  = f'-${week_loss:.2f}' if week_loss > 0 else '+$0.00'
-    system_line = f'SYSTEM: ✅ Active  |  Week P&L: {week_str}'
+    entry_line = (f'ENTRY: 9:45–11:00am ET  |  25-30Δ ${SPREAD_WIDTH:.0f}-wide  |  '
+                  f'Min credit ${MIN_CREDIT:.2f}  |  Stop {STOP_LOSS_PCT*100:.0f}%  |  '
+                  f'Force close 3:45pm')
+    system_line = f'SYSTEM: ✅ Active  |  Week P&L: {week_str}  |  Scan: every 60s'
 
     msg = (
         f'📊 **MORNING VITALS — {date_str}**\n\n'
@@ -2499,6 +2330,7 @@ def _send_morning_vitals():
         f'{ivr_line}\n'
         f'{macro_line}\n\n'
         f'{pos_lines}\n\n'
+        f'{entry_line}\n'
         f'{system_line}'
     )
 
@@ -2516,28 +2348,28 @@ def run_scan():
     _last_scan_start = _t0
 
     if not is_market_hours():
-        print(f'[{_t0.strftime("%H:%M ET")}] '
-              f'Iron condor: outside market hours, skipping.')
+        print(f'[{_t0.strftime("%H:%M ET")}] 0DTE-V2: outside market hours, skipping.')
         _last_scan_duration = (datetime.now(ET) - _t0).total_seconds()
         return
 
     now_et  = datetime.now(ET)
     now_str = now_et.strftime('%Y-%m-%d %H:%M ET')
 
-    if now_et.hour == 9 and 30 <= now_et.minute < 35:
-        try:
-            _send_morning_vitals()
-        except Exception as e:
-            print(f'  [morning_vitals] ERROR — {type(e).__name__}: {e}')
-            _log({'timestamp': now_str, 'event': 'MORNING_VITALS_ERROR',
-                  'error': f'{type(e).__name__}: {e}'})
+    # ── 0. Morning vitals — fires once at 9:30 ET each trading day ────────────
+    try:
+        _send_morning_vitals()
+    except Exception as e:
+        print(f'  [morning_vitals] ERROR — {type(e).__name__}: {e}')
+        _log({'timestamp': now_str, 'event': 'MORNING_VITALS_ERROR',
+              'error': f'{type(e).__name__}: {e}'})
 
-    print(f'\n[{now_str}] Iron condor scan  (ACTIVE={ACTIVE})…')
+    print(f'\n[{now_str}] 0DTE-V2 scan  (ACTIVE={ACTIVE})…')
 
     pos_state = _load_positions()
     weekly    = _load_weekly()
     weekly    = _reset_weekly_if_needed(weekly)
 
+    # ── 1. Monitor open positions ──────────────────────────────────────────────
     try:
         _monitor_positions(pos_state, weekly, now_str)
     except Exception as e:
@@ -2545,73 +2377,55 @@ def run_scan():
         _log({'timestamp': now_str, 'event': 'MONITOR_ERROR',
               'error': f'{type(e).__name__}: {e}'})
 
+    # ── 2. Daily summary ───────────────────────────────────────────────────────
     try:
         _check_daily_summary(pos_state, weekly, now_str)
     except Exception as e:
         print(f'  [summary] ERROR — {type(e).__name__}: {e}')
 
-    ticker_signals = {}
-    ticker_conds   = {}
-    scan_result    = 'no_signal'
-    chosen         = None
+    # ── 3. Evaluate entry ──────────────────────────────────────────────────────
+    scan_result = 'no_signal'
+    signal = None
+    conds  = {}
+    try:
+        signal, conds = _evaluate_entry(pos_state, weekly, now_str)
+    except Exception as e:
+        print(f'  [entry eval] ERROR — {type(e).__name__}: {e}')
+        _log({'timestamp': now_str, 'event': 'ENTRY_EVAL_ERROR',
+              'error': f'{type(e).__name__}: {e}'})
 
-    for ticker in TICKERS:
-        try:
-            signal, conds = _evaluate_ticker(ticker, pos_state, weekly, now_str)
-            ticker_conds[ticker] = conds
-            if signal:
-                ticker_signals[ticker] = signal
-        except Exception as e:
-            print(f'  [{ticker}] conditions ERROR — {type(e).__name__}: {e}')
-            _log({'timestamp': now_str, 'event': 'CONDITIONS_ERROR',
-                  'ticker': ticker, 'error': f'{type(e).__name__}: {e}'})
-
-    if ticker_signals:
-        chosen = max(ticker_signals.values(),
-                     key=lambda s: s['put_credit'] + s['call_credit'])
-
-    if chosen:
-        t = chosen['ticker']
-        total_credit = chosen['put_credit'] + chosen['call_credit']
+    # ── 4. Execute entry ───────────────────────────────────────────────────────
+    if signal:
+        s = signal
         if not ACTIVE:
             scan_result = 'dormant_would_enter'
             print(
                 f'  DORMANT MODE — entry skipped | '
-                f'{t} {chosen["short_put_strike"]:.0f}/{chosen["long_put_strike"]:.0f}P '
-                f'{chosen["short_call_strike"]:.0f}/{chosen["long_call_strike"]:.0f}C  '
-                f'exp={chosen["expiry"]}  credit=${total_credit:.4f}'
+                f'SPY {s["short_strike"]:.0f}/{s["long_strike"]:.0f}P  '
+                f'exp={s["expiry"]}  credit=${s["credit"]:.4f}  '
+                f'delta={s["short_delta"]:.3f}'
             )
         else:
-            print(f'  ENTERING: {t} {chosen["short_put_strike"]:.0f}/{chosen["long_put_strike"]:.0f}P '
-                  f'{chosen["short_call_strike"]:.0f}/{chosen["long_call_strike"]:.0f}C  '
-                  f'exp={chosen["expiry"]}  credit=${total_credit:.4f}')
+            print(f'  ENTERING: SPY {s["short_strike"]:.0f}/{s["long_strike"]:.0f}P  '
+                  f'exp={s["expiry"]}  credit=${s["credit"]:.4f}')
             filled = _attempt_entry(
-                pos_state, weekly, now_str, t,
-                chosen['short_put'], chosen['long_put'],
-                chosen['short_call'], chosen['long_call'],
-                chosen['short_put_strike'], chosen['long_put_strike'],
-                chosen['short_call_strike'], chosen['long_call_strike'],
-                chosen['expiry'], chosen['put_credit'], chosen['call_credit'],
-                chosen['stock_px'], chosen['short_put_delta'], chosen['short_call_delta'],
+                pos_state, weekly, now_str,
+                s['short_sym'], s['long_sym'],
+                s['short_strike'], s['long_strike'],
+                s['expiry'], s['credit'],
+                s['spy_px'], s['short_delta'],
             )
             scan_result = 'entry_filled' if filled else 'entry_not_filled'
     else:
-        macro_detail = next(
-            (c['macro_event']['detail']
-             for c in ticker_conds.values()
-             if not c.get('macro_event', {}).get('passed', True)),
-            None,
-        )
-        if macro_detail:
-            print(f'  No entry — macro event day: {macro_detail}')
-        else:
-            for t, conds in ticker_conds.items():
-                fails = [k for k, v in conds.items() if not v.get('passed')]
-                if 'underwater_block' in fails:
-                    print(f'  [{t}] No entry — blocked: existing position underwater')
-                elif fails:
-                    print(f'  [{t}] No entry — failed: {", ".join(fails)}')
+        fails = [k for k, v in conds.items() if not v.get('passed')]
+        if 'macro_event' in fails:
+            print(f'  No entry — macro event day: {conds["macro_event"]["detail"]}')
+        elif 'underwater_block' in fails:
+            print('  No entry — blocked: existing position underwater')
+        elif fails:
+            print(f'  No entry — failed: {", ".join(fails)}')
 
+    # ── 5. Log scan ────────────────────────────────────────────────────────────
     _last_scan_duration = (datetime.now(ET) - _t0).total_seconds()
     print(f'  [run_scan] completed in {_last_scan_duration:.1f}s')
 
@@ -2624,21 +2438,16 @@ def run_scan():
         'weekly_loss':    weekly.get('weekly_realized_loss', 0.0),
         'cooldown':       weekly.get('cooldown_active', False),
         'scan_duration_s': round(_last_scan_duration, 1),
-        'conditions':     ticker_conds,
+        'conditions':     conds,
     }
-    if scan_result in ('dormant_would_enter', 'entry_filled', 'entry_not_filled') and chosen:
+    if signal and scan_result in ('dormant_would_enter', 'entry_filled', 'entry_not_filled'):
         log_entry['signal'] = {
-            'ticker':           chosen['ticker'],
-            'short_put':        chosen['short_put'],
-            'long_put':         chosen['long_put'],
-            'short_call':       chosen['short_call'],
-            'long_call':        chosen['long_call'],
-            'expiry':           str(chosen['expiry']),
-            'put_credit':       chosen['put_credit'],
-            'call_credit':      chosen['call_credit'],
-            'short_put_delta':  round(chosen['short_put_delta'], 4) if chosen['short_put_delta'] else None,
-            'short_call_delta': round(chosen['short_call_delta'], 4) if chosen['short_call_delta'] else None,
-            'stock_px':         chosen['stock_px'],
+            'short_symbol': signal['short_sym'],
+            'long_symbol':  signal['long_sym'],
+            'expiry':       str(signal['expiry']),
+            'credit':       signal['credit'],
+            'short_delta':  round(signal['short_delta'], 4) if signal['short_delta'] else None,
+            'spy_px':       signal['spy_px'],
         }
     _log(log_entry)
 
@@ -2646,26 +2455,27 @@ def run_scan():
 # ── ENTRY POINT ────────────────────────────────────────────────────────────────
 
 def main():
-    print('=' * 62)
-    print('  SPY IRON CONDOR  |  7 DTE  |  20Δ / $5-wide  |  Mode A (combined stop)')
+    print('=' * 64)
+    print('  0DTE-V2 SPY PUT CREDIT SPREADS  |  25-30Δ / $3-wide')
     print(f'  ACTIVE = {ACTIVE}')
     if not ACTIVE:
         print('  *** DORMANT — scanning and logging, NO orders placed ***')
-    print('  Alpaca v2 REST API  |  raw requests  |  no SDK  |  4-leg mleg orders')
-    print('  Scan every 5 min, 9:30–16:00 ET, Mon–Fri')
-    print('=' * 62)
+    print('  Entry: 9:45–11:00am ET  |  Force close: 3:45pm ET')
+    print('  Alpaca v2 REST API  |  raw requests  |  no SDK')
+    print('  Scan every 60s, 9:30–16:00 ET, Mon–Fri')
+    print('=' * 64)
 
     _init_db()
     _init_files()
     _reconcile_on_startup()
 
-    schedule.every(5).minutes.do(run_scan)
+    schedule.every(60).seconds.do(run_scan)
 
     if ACTIVE:
         _discord(
-            f'✅ Iron Condor system live | SPY 7DTE iron condor | '
-            f'20Δ put + 20Δ call, $5-wide each | ${MIN_CREDIT_LEG:.2f} min credit/leg | '
-            f'2 positions max'
+            f'✅ 0DTE-V2 system live | SPY 0DTE put spreads | '
+            f'25-30Δ short / ${SPREAD_WIDTH:.0f}-wide / ${MIN_CREDIT:.2f} min credit | '
+            f'{MAX_POSITIONS} positions max | Entry 9:45–11:00am | Force close 3:45pm'
         )
     else:
         print('  Dormant mode: conditions evaluated and logged each scan.')
@@ -2684,7 +2494,7 @@ def main():
                       f'since={since_s:.0f}s | '
                       f'last_duration={_last_scan_duration:.1f}s')
 
-                if since_s > 600:
+                if since_s > 300:   # 5-minute watchdog — tighter than 7DTE's 10min, scans run every 60s here
                     lag_min = round(since_s / 60, 1)
                     print(f'[scheduler] ⚠️  SCHEDULER_LAG — {lag_min} min since last scan started')
                     _log({'timestamp': tick_str, 'event': 'SCHEDULER_LAG',
@@ -2699,7 +2509,7 @@ def main():
             print(f'[scheduler] ERROR — {type(e).__name__}: {e}')
             _log({'timestamp': tick_str, 'event': 'SCHEDULER_ERROR',
                   'error': f'{type(e).__name__}: {e}'})
-        time.sleep(30)
+        time.sleep(10)
 
 
 if __name__ == '__main__':
@@ -2709,3 +2519,4 @@ if __name__ == '__main__':
         import traceback
         print(f'[FATAL] {type(e).__name__}: {e}')
         traceback.print_exc()
+        raise
