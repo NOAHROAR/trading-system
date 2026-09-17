@@ -2019,7 +2019,11 @@ _entry_blocked_alert_sent = False
 
 def _check_entry_conditions(pos_state, weekly):
     """
-    Evaluate all gates cheapest-first. Short-circuits on first group failure.
+    Evaluate all gates cheapest-first. Short-circuits on first group failure,
+    EXCEPT 'active' (see _passed() below) — ACTIVE=False never blocks the
+    real market-data gates (SMA/IVR/VIX) or the downstream chain/strike/
+    credit evaluation in _evaluate_entry(); it only gates real order
+    placement, further downstream in run_scan()/_attempt_entry().
     Returns (all_passed: bool, conditions: dict, spy_px, ivr, vix).
     """
     global _entry_blocked_alert_sent
@@ -2028,6 +2032,16 @@ def _check_entry_conditions(pos_state, weekly):
 
     def _c(name, passed, detail):
         conds[name] = {'passed': bool(passed), 'detail': str(detail)}
+
+    def _passed(exclude=('active',)):
+        """All conditions passed, ignoring keys in `exclude`. 'active' is
+        still recorded via _c() above for visibility/logging, but excluded
+        here so ACTIVE=False (dormant mode) doesn't stop SMA/IVR/VIX/delta/
+        credit from being evaluated and logged on every scan. The real
+        order-placement decision still depends on ACTIVE downstream, in
+        run_scan()'s dormant_would_enter branch and in _attempt_entry()'s
+        own ACTIVE gate — unchanged by this."""
+        return all(v['passed'] for k, v in conds.items() if k not in exclude)
 
     # Hard guard: never evaluate or pass ANY gate on state loaded via the
     # degraded fallback path.
@@ -2067,7 +2081,7 @@ def _check_entry_conditions(pos_state, weekly):
     _c('weekly_cooldown', not weekly.get('cooldown_active', False),
        f'loss=${weekly.get("weekly_realized_loss", 0):.2f} / ${WEEKLY_LOSS_LIMIT:.0f}')
 
-    if not all(v['passed'] for v in conds.values()):
+    if not _passed():
         return False, conds, spy_px, ivr, vix
 
     # Underwater position gate — don't add a second spread if the first is at a loss
@@ -2089,7 +2103,7 @@ def _check_entry_conditions(pos_state, weekly):
         _c('spy_above_sma', above_sma,
            f'SPY={spy_close:.2f}  SMA20={sma_val:.2f}  {"above" if above_sma else "BELOW"}')
 
-    if not all(v['passed'] for v in conds.values()):
+    if not _passed():
         return False, conds, spy_px, ivr, vix
 
     ivr, vix = _spy_ivrank()
@@ -2102,7 +2116,7 @@ def _check_entry_conditions(pos_state, weekly):
         _c('vix_cap',  vix < MAX_VIX,
            f'SPY IV={vix:.1f}% {"<" if vix < MAX_VIX else "≥"} {MAX_VIX:.0f}%')
 
-    return all(v['passed'] for v in conds.values()), conds, spy_px, ivr, vix
+    return _passed(), conds, spy_px, ivr, vix
 
 
 # ── SIGNAL EVALUATION ──────────────────────────────────────────────────────────
